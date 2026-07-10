@@ -12,10 +12,13 @@ use std::rc::Rc;
 use std::collections::HashSet;
 use std::collections::hash_map::Iter;
 use std::collections::HashMap;
+use std::collections::{BTreeSet, VecDeque};
+use petgraph::visit::EdgeRef;
+use rustc_middle::mir::Location;
 use crate::mir::call_site::{BaseCallSite, CSCallSite};
 use crate::mir::context::{Context, ContextCache, ContextElement, ContextId, HybridCtxElem};
 use crate::mir::function::FuncId;
-use crate::mir::path::{CSPath, Path};
+use crate::mir::path::{CSPath, Path, PathEnum};
 use crate::rustc_index::Idx;
 use super::stack_filtering::{StackFilter, SFReachable};
 use crate::pre_analysis::precision_critical_func_identification::func_pointer_flow_analysis::FuncPFG;
@@ -704,3 +707,205 @@ impl ContextStrategy for RCEUSMergeCallSiteSensitive {
         Some(&self.cs_funcs)
     }
 }
+
+// ===========================================================================
+// EXPERIMENTAL (env RCEUS_ARGPROV): argument-provenance-qualified flow-entry.
+//
+// Refines RCEUS's single flow-entry element [ℓ] into
+//   [ Site(ℓ), ParamProv(p, {entry-args})... ]
+// separating precision-critical callees by WHICH argument(s) of the flow-entry
+// callsite their data originates from. Entry-arg indices are the ORIGIN
+// positions at the flow-entry callsite (provenance), carried unchanged down the
+// chain, and each set is kept ascending so {#1,#2} and {#2,#1} intern to the
+// same context (no duplicated contexts).
+// ===========================================================================
+
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum ProvElem {
+    Site(BaseCallSite),
+    /// (callee parameter ordinal, sorted-ascending set of flow-entry arg indices)
+    ParamProv(u32, Vec<u32>),
+}
+impl ContextElement for ProvElem {}
+
+type ArgParamReach = HashMap<FuncId, HashMap<Location, Vec<(usize, Vec<u32>)>>>;
+
+pub struct RCEUSArgProvSensitive {
+    ctx_cache: ContextCache<ProvElem>,
+    cs_funcs: HashSet<FuncId>,
+    func_pfg_map: HashMap<FuncId, FuncPFG>,
+    /// caller func -> callsite loc -> [(arg index, caller param ordinals reaching it)]
+    arg_param_reach: ArgParamReach,
+}
+
+impl RCEUSArgProvSensitive {
+    pub fn new(_k: usize) -> Self {
+        Self {
+            ctx_cache: ContextCache::new(),
+            cs_funcs: HashSet::new(),
+            func_pfg_map: HashMap::new(),
+            arg_param_reach: HashMap::new(),
+        }
+    }
+
+    /// For a function's PFG: which caller parameters reach each callsite argument
+    /// (reverse reachability). Computed once in pre-analysis.
+    fn build_arg_param_reach(pfg: &FuncPFG) -> HashMap<Location, Vec<(usize, Vec<u32>)>> {
+        let mut node_of: HashMap<Rc<Path>, _> = HashMap::new();
+        for n in pfg.graph.node_indices() {
+            node_of.insert(pfg.graph[n].path.clone(), n);
+        }
+        let mut out: HashMap<Location, Vec<(usize, Vec<u32>)>> = HashMap::new();
+        for (loc, (args, _dest)) in &pfg.callsite_to_locals {
+            let mut per_call: Vec<(usize, Vec<u32>)> = Vec::new();
+            for (arg_idx, arg_path) in args {
+                let start = match node_of.get(arg_path) { Some(&n) => n, None => continue };
+                let mut seen: HashSet<_> = HashSet::new();
+                let mut q: VecDeque<_> = VecDeque::new();
+                q.push_back(start);
+                let mut params: BTreeSet<u32> = BTreeSet::new();
+                while let Some(x) = q.pop_front() {
+                    if !seen.insert(x) { continue; }
+                    if let PathEnum::Parameter { ordinal, .. } = pfg.graph[x].path.value {
+                        params.insert(ordinal as u32);
+                    }
+                    for e in pfg.graph.edges_directed(x, petgraph::Direction::Incoming) {
+                        q.push_back(e.source());
+                    }
+                }
+                if !params.is_empty() {
+                    per_call.push((*arg_idx, params.into_iter().collect()));
+                }
+            }
+            if !per_call.is_empty() {
+                out.insert(*loc, per_call);
+            }
+        }
+        out
+    }
+
+    fn argprov_context(
+        cache: &mut ContextCache<ProvElem>,
+        func_pfg_map: &HashMap<FuncId, FuncPFG>,
+        arg_param_reach: &ArgParamReach,
+        callsite: &Rc<CSCallSite>,
+        caller_pfg: &FuncPFG,
+        callee: FuncId,
+    ) -> ContextId {
+        let caller_func = callsite.func.func_id;
+        let loc = callsite.location;
+        let caller_ctx = cache.get_context(callsite.func.cid).unwrap_or(Context::new_empty());
+        let is_flow_entry = !caller_pfg.is_cs_callsite(&loc);
+
+        let mut elems: Vec<ProvElem> = Vec::new();
+
+        if is_flow_entry {
+            // callee is a fresh flow-entry function: its params ARE the entry args
+            // (identity provenance).
+            elems.push(ProvElem::Site(BaseCallSite::new(caller_func, loc)));
+            if let Some(pfg) = func_pfg_map.get(&callee) {
+                // Only params that reach the return: these are exactly the ones
+                // that can propagate through a downstream flow-through (cs_)
+                // callsite, so they are the correct entry-arg set. (A param that
+                // feeds a flow-through arg is pulled into param_with_flow by
+                // construction; params outside it never propagate provenance.)
+                let mut params: Vec<u32> = pfg.param_with_flow.iter().map(|p| *p as u32).collect();
+                params.sort();
+                for p in params {
+                    elems.push(ProvElem::ParamProv(p, vec![p]));
+                }
+            }
+        } else {
+            // flow-through: inherit the flow-entry site; map each callee param to
+            // entry-args by tracing the callsite arg back through the caller's
+            // provenance (initial arg number, not the current position).
+            let site = match caller_ctx.context_elems.first() {
+                Some(ProvElem::Site(s)) => *s,
+                _ => BaseCallSite::new(caller_func, loc),
+            };
+            elems.push(ProvElem::Site(site));
+            let mut caller_map: HashMap<u32, Vec<u32>> = HashMap::new();
+            for e in &caller_ctx.context_elems {
+                if let ProvElem::ParamProv(p, s) = e { caller_map.insert(*p, s.clone()); }
+            }
+            if let Some(argreach) = arg_param_reach.get(&caller_func).and_then(|m| m.get(&loc)) {
+                let mut prov: Vec<(u32, Vec<u32>)> = Vec::new();
+                for (arg_idx, caller_params) in argreach {
+                    let mut set: BTreeSet<u32> = BTreeSet::new();
+                    for cp in caller_params {
+                        if let Some(s) = caller_map.get(cp) {
+                            for e in s { set.insert(*e); }
+                        }
+                    }
+                    if !set.is_empty() {
+                        prov.push((*arg_idx as u32, set.into_iter().collect()));
+                    }
+                }
+                prov.sort();
+                for (p, s) in prov {
+                    elems.push(ProvElem::ParamProv(p, s));
+                }
+            }
+        }
+
+        let ctx = Rc::new(Context { context_elems: elems });
+        cache.get_context_id(&ctx)
+    }
+}
+
+impl ContextStrategy for RCEUSArgProvSensitive {
+    type E = ProvElem;
+
+    fn empty_context(&self) -> Rc<Context<ProvElem>> { Context::new_empty() }
+    fn get_empty_context_id(&mut self) -> ContextId {
+        self.ctx_cache.get_context_id(&Context::new_empty())
+    }
+    fn get_context_id(&mut self, context: &Rc<Context<ProvElem>>) -> ContextId {
+        self.ctx_cache.get_context_id(context)
+    }
+    fn get_context_by_id(&self, context_id: ContextId) -> Rc<Context<ProvElem>> {
+        self.ctx_cache.get_context(context_id).unwrap_or(Context::new_empty())
+    }
+    fn get_context_iter(&self) -> Option<Iter<'_, Rc<Context<ProvElem>>, ContextId>> {
+        Some(self.ctx_cache.get_context_iter())
+    }
+
+    fn new_static_call_context(&mut self, callsite: &Rc<CSCallSite>, callee: FuncId) -> ContextId {
+        if self.cs_funcs.contains(&callee) {
+            if let Some(caller_pfg) = self.func_pfg_map.get(&callsite.func.func_id) {
+                return Self::argprov_context(
+                    &mut self.ctx_cache, &self.func_pfg_map, &self.arg_param_reach,
+                    callsite, caller_pfg, callee);
+            }
+        }
+        self.get_empty_context_id()
+    }
+
+    fn new_instance_call_context(
+        &mut self,
+        callsite: &Rc<CSCallSite>,
+        _receiver: Option<&Rc<CSPath>>,
+        callee: FuncId,
+    ) -> Option<ContextId> {
+        if self.cs_funcs.contains(&callee) {
+            if let Some(caller_pfg) = self.func_pfg_map.get(&callsite.func.func_id) {
+                return Some(Self::argprov_context(
+                    &mut self.ctx_cache, &self.func_pfg_map, &self.arg_param_reach,
+                    callsite, caller_pfg, callee));
+            }
+        }
+        Some(self.get_empty_context_id())
+    }
+
+    fn set_prec_crit_fn_ident_data(&mut self, cs_funcs: HashSet<FuncId>, func_pfg_map: HashMap<FuncId, FuncPFG>) {
+        let mut reach: ArgParamReach = HashMap::new();
+        for (f, pfg) in &func_pfg_map {
+            let m = Self::build_arg_param_reach(pfg);
+            if !m.is_empty() { reach.insert(*f, m); }
+        }
+        self.cs_funcs = cs_funcs;
+        self.func_pfg_map = func_pfg_map;
+        self.arg_param_reach = reach;
+    }
+}
+

@@ -14,7 +14,7 @@ use self::andersen::AndersenPTA;
 use self::context_sensitive::ContextSensitivePTA;
 use self::strategies::context_strategy::{
     KCallSiteSensitive, RCEUSCallSiteSensitive, RCEUSMergeCallSiteSensitive,
-    SelectiveCallSiteSensitive,
+    RCEUSArgProvSensitive, SelectiveCallSiteSensitive,
 };
 use crate::graph::pag::*;
 use crate::mir::function::FuncId;
@@ -99,7 +99,12 @@ impl PTACallbacks {
                         // context-insensitive for the rest.
                         Box::new(ContextSensitivePTA::new(&mut acx, RCEUSCallSiteSensitive::new_selective(k)))
                     } else if self.options.rceus {
-                        Box::new(ContextSensitivePTA::new(&mut acx, RCEUSCallSiteSensitive::new(k)))
+                        // RCEUS_ARGPROV: argument-provenance-qualified flow entry.
+                        if std::env::var("RCEUS_ARGPROV").is_ok() {
+                            Box::new(ContextSensitivePTA::new(&mut acx, RCEUSArgProvSensitive::new(k)))
+                        } else {
+                            Box::new(ContextSensitivePTA::new(&mut acx, RCEUSCallSiteSensitive::new(k)))
+                        }
                     } else if self.options.selective_cs {
                         Box::new(ContextSensitivePTA::new(&mut acx, SelectiveCallSiteSensitive::new(k)))
                     } else {
