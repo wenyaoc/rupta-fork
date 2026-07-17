@@ -408,3 +408,115 @@ impl ContextStrategy for RCEUSCallSiteSensitive {
         self.func_pfg_map = func_pfg_map;
     }
 }
+
+
+/// RCEUS with redundant flow-entry callsite merging (`--rceus-m`).
+///
+/// Identical to [`RCEUSCallSiteSensitive`] except for the label given to a
+/// flow-entry callsite. RCEUS labels a flow entry with the callsite itself, so
+/// two callsites handing a callee the very same pointers still induce two
+/// contexts. This strategy instead labels each flow entry with the canonical
+/// member of its redundant group -- the smallest-bb callsite among those in the
+/// caller that target the same callee and whose flowing arguments share
+/// backward roots -- so those duplicate contexts collapse into one.
+///
+/// The groups are computed in the pre-analysis and carried on each caller's
+/// [`FuncPFG::flow_entry_merge`]; here we only consult them. Which functions are
+/// precision critical is unaffected.
+pub struct RCEUSMergeCallSiteSensitive {
+    inner: KCallSiteSensitive,
+    cs_funcs: HashSet<FuncId>,
+    func_pfg_map: HashMap<FuncId, FuncPFG>,
+}
+
+impl RCEUSMergeCallSiteSensitive {
+    pub fn new(k: usize) -> Self {
+        Self {
+            inner: KCallSiteSensitive::new(k),
+            cs_funcs: HashSet::new(),
+            func_pfg_map: HashMap::new(),
+        }
+    }
+
+    /// As `RCEUSCallSiteSensitive::rceus_context`, but a flow-entry callsite is
+    /// labelled by its group's canonical callsite.
+    fn rceus_merge_context(
+        inner: &mut KCallSiteSensitive,
+        callsite: &Rc<CSCallSite>,
+        caller_pfg: &FuncPFG,
+    ) -> ContextId {
+        let caller_ctx = inner.get_context_by_id(callsite.func.cid);
+        let caller_ctx_elem = &caller_ctx.context_elems;
+        let callsite_location = callsite.location;
+
+        let flow_entry = if !caller_pfg.is_cs_callsite(&callsite_location) {
+            // This callsite is the flow entry. Label it with the canonical
+            // member of its redundant group; callsites that are their own
+            // representative keep their own location, exactly as in RCEUS.
+            let mut elem: BaseCallSite = callsite.into();
+            elem.location = caller_pfg.canonical_flow_entry(&callsite_location);
+            elem
+        } else {
+            // Flow-through: inherit the caller's flow entry, which is already
+            // canonical because it was labelled when that entry was created.
+            caller_ctx_elem.first().unwrap().clone()
+        };
+
+        let mut new_callee_ctx_elem = vec![flow_entry];
+        let callee_ctx = Context::new_k_limited_context(&caller_ctx, callsite.into(), inner.k);
+        new_callee_ctx_elem.extend(callee_ctx.context_elems.iter().cloned());
+        let new_callee_ctx = Rc::new(Context { context_elems: new_callee_ctx_elem });
+        inner.ctx_cache.get_context_id(&new_callee_ctx)
+    }
+}
+
+impl ContextStrategy for RCEUSMergeCallSiteSensitive {
+    type E = BaseCallSite;
+
+    fn empty_context(&self) -> Rc<Context<BaseCallSite>> { self.inner.empty_context() }
+    fn get_empty_context_id(&mut self) -> ContextId { self.inner.get_empty_context_id() }
+    fn get_context_id(&mut self, context: &Rc<Context<BaseCallSite>>) -> ContextId {
+        self.inner.get_context_id(context)
+    }
+    fn get_context_by_id(&self, context_id: ContextId) -> Rc<Context<BaseCallSite>> {
+        self.inner.get_context_by_id(context_id)
+    }
+    fn get_context_iter(&self) -> Option<Iter<'_, Rc<Context<BaseCallSite>>, ContextId>> {
+        self.inner.get_context_iter()
+    }
+
+    fn new_static_call_context(&mut self, callsite: &Rc<CSCallSite>, callee: FuncId) -> ContextId {
+        if self.cs_funcs.contains(&callee) {
+            if let Some(caller_pfg) = self.func_pfg_map.get(&callsite.func.func_id) {
+                return Self::rceus_merge_context(&mut self.inner, callsite, caller_pfg);
+            }
+        }
+        self.inner.new_static_call_context(callsite, callee)
+    }
+
+    fn new_instance_call_context(
+        &mut self,
+        callsite: &Rc<CSCallSite>,
+        receiver: Option<&Rc<CSPath>>,
+        callee: FuncId,
+    ) -> Option<ContextId> {
+        if self.cs_funcs.contains(&callee) {
+            if let Some(caller_pfg) = self.func_pfg_map.get(&callsite.func.func_id) {
+                return Some(Self::rceus_merge_context(&mut self.inner, callsite, caller_pfg));
+            }
+        }
+        self.inner.new_instance_call_context(callsite, receiver, callee)
+    }
+
+    fn with_stack_filter<F: SFReachable>(&mut self, stack_filter: &mut StackFilter<F>)
+    where
+        F: Copy + Into<FuncId> + std::cmp::Eq + std::hash::Hash,
+    {
+        self.inner.with_stack_filter(stack_filter);
+    }
+
+    fn set_prec_crit_fn_ident_data(&mut self, cs_funcs: HashSet<FuncId>, func_pfg_map: HashMap<FuncId, FuncPFG>) {
+        self.cs_funcs = cs_funcs;
+        self.func_pfg_map = func_pfg_map;
+    }
+}

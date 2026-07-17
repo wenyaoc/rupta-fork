@@ -12,7 +12,9 @@ use rustc_middle::ty::TyCtxt;
 
 use self::andersen::AndersenPTA;
 use self::context_sensitive::ContextSensitivePTA;
-use self::strategies::context_strategy::{KCallSiteSensitive, RCEUSCallSiteSensitive};
+use self::strategies::context_strategy::{
+    KCallSiteSensitive, RCEUSCallSiteSensitive, RCEUSMergeCallSiteSensitive,
+};
 use crate::graph::pag::*;
 use crate::mir::function::FuncId;
 use crate::mir::analysis_context::AnalysisContext;
@@ -89,7 +91,9 @@ impl PTACallbacks {
             let mut pta: Box<dyn PointerAnalysis> = match self.options.pta_type {
                 PTAType::CallSiteSensitive => {
                     let k = self.options.context_depth as usize;
-                    if self.options.rceus {
+                    if self.options.rceus_m {
+                        Box::new(ContextSensitivePTA::new(&mut acx, RCEUSMergeCallSiteSensitive::new(k)))
+                    } else if self.options.rceus {
                         Box::new(ContextSensitivePTA::new(&mut acx, RCEUSCallSiteSensitive::new(k)))
                     } else {
                         Box::new(ContextSensitivePTA::new(&mut acx, KCallSiteSensitive::new(k)))

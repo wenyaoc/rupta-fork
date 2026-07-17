@@ -61,9 +61,16 @@ pub struct FuncPFG {
     // record of closure and dynamic dispatch call-sites
     pub closure_dyn_callsites: HashSet<Location>, 
     // call-sites with arg->return path
-    pub cs_callsites: HashSet<Location>, 
+    pub cs_callsites: HashSet<Location>,
     // parameter with flow to return
     pub param_with_flow: HashSet<usize>,
+    /// Redundant flow-entry callsite merging (`--rceus-merge`). Maps a redundant
+    /// flow-entry callsite to the canonical one representing its group: the
+    /// smallest-bb callsite among the flow entries in this function that target
+    /// the same callee and whose flowing arguments reach the same backward
+    /// roots. Callsites absent from the map represent themselves. Left empty
+    /// under plain `--rceus`, so baseline behaviour is unchanged.
+    pub flow_entry_merge: HashMap<Location, Location>,
 }
 
 
@@ -80,6 +87,7 @@ impl FuncPFG {
             closure_dyn_callsites: HashSet::new(),
             cs_callsites: HashSet::new(),
             param_with_flow: HashSet::new(),
+            flow_entry_merge: HashMap::new(),
         }
     }
 
@@ -120,6 +128,48 @@ impl FuncPFG {
     // check loc ⇒ 𝑓 in CTXFunc
     pub fn is_cs_callsite(&self, loc: &Location) -> bool {
         self.cs_callsites.contains(loc)
+    }
+
+    /// The canonical flow-entry callsite representing `loc`'s merge group, or
+    /// `loc` itself when it is not merged (always the case under plain --rceus,
+    /// where the map is empty).
+    pub fn canonical_flow_entry(&self, loc: &Location) -> Location {
+        *self.flow_entry_merge.get(loc).unwrap_or(loc)
+    }
+
+    /// The backward roots of `path`: the sources it flows from. Walks Incoming
+    /// edges back to the predecessor-less nodes and returns their indices
+    /// (sorted, deduped) — stable identifiers within this function's PFG, which
+    /// is all the merge grouping needs.
+    ///
+    /// `None` means `path` has no node in this PFG. That must stay distinct from
+    /// `Some(vec![])`: an absent node means the argument's provenance is unknown,
+    /// so its callsite must never be merged with another.
+    pub fn backward_roots(&self, path: &Rc<Path>) -> Option<Vec<usize>> {
+        let start = self
+            .graph
+            .node_indices()
+            .find(|&n| self.graph[n].path == *path)?;
+        let mut seen: HashSet<NodeIndex> = HashSet::new();
+        let mut roots: Vec<usize> = Vec::new();
+        let mut q = VecDeque::new();
+        q.push_back(start);
+        while let Some(n) = q.pop_front() {
+            if !seen.insert(n) {
+                continue;
+            }
+            let mut has_pred = false;
+            for e in self.graph.edges_directed(n, petgraph::Direction::Incoming) {
+                has_pred = true;
+                q.push_back(e.source());
+            }
+            if !has_pred {
+                roots.push(n.index());
+            }
+        }
+        roots.sort_unstable();
+        roots.dedup();
+        Some(roots)
     }
 
     /// Solve the reachability in the pointer flow graph.
@@ -272,6 +322,15 @@ impl<'a, 'rta, 'tcx, 'compilation> FuncPointerFlowAnalysis<'a, 'rta, 'tcx, 'comp
             self.visit_body();
             self.solve_graph_initial();
         } else {
+            // --rceus-m: build the graph anyway, without solving reachability.
+            // A function that cannot carry an arg->return pointer flow is still
+            // a *caller*, and merging its flow-entry callsites needs its graph
+            // and callsite_to_locals to root their arguments. Skipping
+            // solve_graph_initial keeps has_arg_to_return_flow false, so this
+            // function stays non-precision-critical exactly as before.
+            if self.rta.acx.analysis_options.rceus_m {
+                self.visit_body();
+            }
             self.pfg.has_arg_to_return_flow = false;
             self.pfg.cs_callsites.clear();
         }

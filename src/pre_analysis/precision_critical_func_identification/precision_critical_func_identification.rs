@@ -3,6 +3,8 @@ use std::time::{Duration, Instant};
 
 use petgraph::visit::EdgeRef;
 
+use rustc_middle::mir::Location;
+
 use crate::graph::call_graph::{CGCallSite, CGNodeId};
 use crate::mir::function::FuncId;
 use crate::pre_analysis::rta::rta::RapidTypeAnalysis;
@@ -71,10 +73,167 @@ impl<'r, 'a, 'tcx, 'compilation> PrecCritFnIdent<'r, 'a, 'tcx, 'compilation> {
             }
         }
 
+        // Tripwire: must be identical between --rceus and --rceus-m. Merging
+        // relabels flow entries; it must never change which functions are
+        // precision critical.
+        println!("RCEUS cs_funcs: {}", self.cs_funcs.len());
+
+        // --rceus-m only: identify redundant flow-entry callsites. Runs after
+        // cs_funcs is final, since the grouping only concerns callees that
+        // receive a context.
+        if self.rta.acx.analysis_options.rceus_m {
+            self.compute_flow_entry_merge();
+        }
+
         self.analysis_time = now.elapsed();
         println!(
             "Precision-critical function identification time: {}",
             humantime::format_duration(self.analysis_time).to_string()
+        );
+    }
+
+    /// Identify redundant flow-entry callsites (`--rceus-m`).
+    ///
+    /// Within one caller, two flow-entry callsites are redundant when they call
+    /// the same callee and every flowing argument -- an argument at a position
+    /// in the callee's `param_with_flow`, i.e. one that reaches the callee's
+    /// return -- flows from the same local in the caller's PFG. Those callsites
+    /// hand the callee identical pointers, so the separate contexts they induce
+    /// are duplicates. Each group is keyed by its smallest-bb callsite; the rest
+    /// map onto it.
+    ///
+    /// This only relabels flow-entry contexts. `cs_funcs`, `cs_callsites` and
+    /// the PFG reachability are untouched, so which functions are precision
+    /// critical is identical to plain --rceus.
+    fn compute_flow_entry_merge(&mut self) {
+        // (callee, [(arg position, backward roots)]) -> the flow entries carrying it
+        type GroupKey = (FuncId, Vec<(usize, Vec<usize>)>);
+
+        let mut merged: HashMap<FuncId, HashMap<Location, Location>> = HashMap::new();
+        let mut groups_merged = 0usize;
+        let mut sites_merged = 0usize;
+
+        {
+            let cg = &self.rta.call_graph;
+            for caller_node in cg.graph.node_indices() {
+                let caller_func = cg.graph[caller_node].func;
+                let caller_pfg = match self.func_pfg_map.get(&caller_func) {
+                    Some(p) => p,
+                    None => continue,
+                };
+
+                let mut groups: HashMap<GroupKey, Vec<Location>> = HashMap::new();
+                for e in cg.graph.edges_directed(caller_node, petgraph::Direction::Outgoing) {
+                    let loc = *e.weight().callsite.get_location();
+                    // Flow entries only: a flow-through callsite inherits its
+                    // caller's flow entry and is never labelled by its own site.
+                    if caller_pfg.is_cs_callsite(&loc) {
+                        continue;
+                    }
+                    let callee = cg.graph[e.target()].func;
+                    // Only callees that actually receive a context.
+                    if !self.cs_funcs.contains(&callee) {
+                        continue;
+                    }
+                    let param_with_flow = match self.func_pfg_map.get(&callee) {
+                        Some(p) => &p.param_with_flow,
+                        None => continue,
+                    };
+                    let (args, _dest) = match caller_pfg.callsite_to_locals.get(&loc) {
+                        Some(x) => x,
+                        None => continue,
+                    };
+
+                    // Key on the roots of the flowing arguments. If any of them
+                    // has no PFG node its provenance is unknown, so leave the
+                    // callsite unmerged rather than guess.
+                    let mut key_parts: Vec<(usize, Vec<usize>)> = Vec::new();
+                    let mut unknown = false;
+                    for (arg_idx, arg_path) in args {
+                        if !param_with_flow.contains(arg_idx) {
+                            continue;
+                        }
+                        match caller_pfg.backward_roots(arg_path) {
+                            Some(roots) => key_parts.push((*arg_idx, roots)),
+                            None => {
+                                unknown = true;
+                                break;
+                            }
+                        }
+                    }
+                    if unknown || key_parts.is_empty() {
+                        continue;
+                    }
+                    key_parts.sort();
+                    groups.entry((callee, key_parts)).or_default().push(loc);
+                }
+
+                // RCEUS_MERGE_DEBUG=<funcid>: show this caller's groups.
+                if let Ok(w) = std::env::var("RCEUS_MERGE_DEBUG") {
+                    if w.trim().parse::<usize>() == Ok(caller_func.as_usize()) {
+                        println!("=== MERGE_DEBUG caller FuncId({}) ===", caller_func.as_usize());
+                        for ((callee, key), locs) in &groups {
+                            if locs.len() < 2 {
+                                continue; // only show groups that actually merge
+                            }
+                            let name = self.rta.acx.get_function_reference(*callee).to_string();
+                            println!(
+                                "  MERGE {} callsites -> FuncId({}) {}",
+                                locs.len(),
+                                callee.as_usize(),
+                                &name[..name.len().min(64)]
+                            );
+                            println!("    roots={:?}", key);
+                            // Print each callsite's flowing argument paths. If every
+                            // callsite passes the SAME path the merge is exact; if the
+                            // paths differ, root-equality merged distinct objects and
+                            // the merge costs precision.
+                            let pwf = self
+                                .func_pfg_map
+                                .get(callee)
+                                .map(|p| p.param_with_flow.clone())
+                                .unwrap_or_default();
+                            for l in locs {
+                                if let Some((args, _)) = caller_pfg.callsite_to_locals.get(l) {
+                                    let shown: Vec<String> = args
+                                        .iter()
+                                        .filter(|(i, _)| pwf.contains(i))
+                                        .map(|(i, p)| format!("#{}={:?}", i, p))
+                                        .collect();
+                                    println!("      {:?}  {}", l, shown.join(" "));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                for (_key, mut locs) in groups {
+                    if locs.len() < 2 {
+                        continue;
+                    }
+                    // Canonical = smallest bb, then statement index so the choice
+                    // is deterministic when one block holds several.
+                    locs.sort_by_key(|l| (l.block.as_usize(), l.statement_index));
+                    let canonical = locs[0];
+                    let m = merged.entry(caller_func).or_default();
+                    for l in locs.into_iter().skip(1) {
+                        m.insert(l, canonical);
+                        sites_merged += 1;
+                    }
+                    groups_merged += 1;
+                }
+            }
+        }
+
+        for (func_id, map) in merged {
+            if let Some(pfg) = self.func_pfg_map.get_mut(&func_id) {
+                pfg.flow_entry_merge = map;
+            }
+        }
+
+        println!(
+            "RCEUS merge-fe: {} redundant flow-entry callsites merged into {} groups",
+            sites_merged, groups_merged
         );
     }
 

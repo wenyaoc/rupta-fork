@@ -65,6 +65,11 @@ fn make_options_parser() -> Command<'static> {
             .long("rceus")
             .takes_value(false)
             .help("Enable rceus in pointer analysis."))
+        .arg(Arg::new("rceus-m")
+            .long("rceus-m")
+            .takes_value(false)
+            .help("Enable rceus with redundant flow-entry callsite merging. \
+                   Implies --rceus."))
         .arg(Arg::new("dump-stats")
             .long("dump-stats")
             .takes_value(false)
@@ -115,6 +120,8 @@ pub struct AnalysisOptions {
     pub cast_constraint: bool,
     pub stack_filtering: bool,
     pub rceus: bool,
+    /// RCEUS + merging of redundant flow-entry callsites. Implies `rceus`.
+    pub rceus_m: bool,
 
     pub dump_stats: bool,
     pub call_graph_output: Option<String>,
@@ -136,6 +143,7 @@ impl Default for AnalysisOptions {
             cast_constraint: true,
             stack_filtering: false,
             rceus: false,
+            rceus_m: false,
             dump_stats: true,
             call_graph_output: None,
             pts_output: None,
@@ -216,7 +224,11 @@ impl AnalysisOptions {
         
         self.cast_constraint = !matches.contains_id("no-cast-constraint");
         self.stack_filtering = matches.contains_id("stack-filtering");
-        self.rceus = matches.contains_id("rceus");
+        self.rceus_m = matches.contains_id("rceus-m");
+        // --rceus-m is RCEUS plus flow-entry merging, so it implies --rceus.
+        // Setting this before context_depth is resolved below lets --rceus-m
+        // inherit the same k=0 default as --rceus.
+        self.rceus = matches.contains_id("rceus") || self.rceus_m;
 
         if let Some(depth) = matches.get_one::<u32>("context-depth") {
             self.context_depth = *depth;
