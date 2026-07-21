@@ -73,11 +73,6 @@ impl<'r, 'a, 'tcx, 'compilation> PrecCritFnIdent<'r, 'a, 'tcx, 'compilation> {
             }
         }
 
-        // Tripwire: must be identical between --rceus and --rceus-m. Merging
-        // relabels flow entries; it must never change which functions are
-        // precision critical.
-        println!("RCEUS cs_funcs: {}", self.cs_funcs.len());
-
         // --rceus-m only: identify redundant flow-entry callsites. Runs after
         // cs_funcs is final, since the grouping only concerns callees that
         // receive a context.
@@ -112,6 +107,7 @@ impl<'r, 'a, 'tcx, 'compilation> PrecCritFnIdent<'r, 'a, 'tcx, 'compilation> {
         let mut merged: HashMap<FuncId, HashMap<Location, Location>> = HashMap::new();
         let mut groups_merged = 0usize;
         let mut sites_merged = 0usize;
+        let mut per_callee: HashMap<FuncId, (usize, usize)> = HashMap::new();
 
         {
             let cg = &self.rta.call_graph;
@@ -168,49 +164,18 @@ impl<'r, 'a, 'tcx, 'compilation> PrecCritFnIdent<'r, 'a, 'tcx, 'compilation> {
                     groups.entry((callee, key_parts)).or_default().push(loc);
                 }
 
-                // RCEUS_MERGE_DEBUG=<funcid>: show this caller's groups.
-                if let Ok(w) = std::env::var("RCEUS_MERGE_DEBUG") {
-                    if w.trim().parse::<usize>() == Ok(caller_func.as_usize()) {
-                        println!("=== MERGE_DEBUG caller FuncId({}) ===", caller_func.as_usize());
-                        for ((callee, key), locs) in &groups {
-                            if locs.len() < 2 {
-                                continue; // only show groups that actually merge
-                            }
-                            let name = self.rta.acx.get_function_reference(*callee).to_string();
-                            println!(
-                                "  MERGE {} callsites -> FuncId({}) {}",
-                                locs.len(),
-                                callee.as_usize(),
-                                &name[..name.len().min(64)]
-                            );
-                            println!("    roots={:?}", key);
-                            // Print each callsite's flowing argument paths. If every
-                            // callsite passes the SAME path the merge is exact; if the
-                            // paths differ, root-equality merged distinct objects and
-                            // the merge costs precision.
-                            let pwf = self
-                                .func_pfg_map
-                                .get(callee)
-                                .map(|p| p.param_with_flow.clone())
-                                .unwrap_or_default();
-                            for l in locs {
-                                if let Some((args, _)) = caller_pfg.callsite_to_locals.get(l) {
-                                    let shown: Vec<String> = args
-                                        .iter()
-                                        .filter(|(i, _)| pwf.contains(i))
-                                        .map(|(i, p)| format!("#{}={:?}", i, p))
-                                        .collect();
-                                    println!("      {:?}  {}", l, shown.join(" "));
-                                }
-                            }
-                        }
-                    }
-                }
-
                 for (_key, mut locs) in groups {
                     if locs.len() < 2 {
                         continue;
                     }
+                    // RCEUS_DUMP_MERGES: per-callee tally of (groups, merged sites).
+                    per_callee
+                        .entry(_key.0)
+                        .and_modify(|e: &mut (usize, usize)| {
+                            e.0 += 1;
+                            e.1 += locs.len() - 1;
+                        })
+                        .or_insert((1, locs.len() - 1));
                     // Canonical = smallest bb, then statement index so the choice
                     // is deterministic when one block holds several.
                     locs.sort_by_key(|l| (l.block.as_usize(), l.statement_index));
@@ -231,10 +196,20 @@ impl<'r, 'a, 'tcx, 'compilation> PrecCritFnIdent<'r, 'a, 'tcx, 'compilation> {
             }
         }
 
-        println!(
-            "RCEUS merge-fe: {} redundant flow-entry callsites merged into {} groups",
-            sites_merged, groups_merged
-        );
+        if let Ok(path) = std::env::var("RCEUS_DUMP_MERGES") {
+            use std::io::Write;
+            let mut w = std::fs::File::create(&path).expect("merge dump");
+            writeln!(w, "# {} redundant flow-entry callsites merged into {} groups",
+                     sites_merged, groups_merged).unwrap();
+            writeln!(w, "# merged_sites\tgroups\tcallee").unwrap();
+            let mut v: Vec<_> = per_callee.iter().collect();
+            v.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+            for (f, (g, sites)) in v {
+                let n = self.rta.acx.get_function_reference(*f).to_string();
+                writeln!(w, "{}\t{}\t{}", sites, g, n).unwrap();
+            }
+        }
+
     }
 
     // Worklist algorithm for context sensitivity identification.
