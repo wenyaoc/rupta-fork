@@ -58,7 +58,7 @@ syntactic callsites. 16 of the top 20 appear in all 16 benchmarks.
 
 Ranking by merge *volume* and by *harm* are nearly disjoint -- only row 1
 overlaps. Measured on zoxide by enabling one merge group at a time
-(`RCEUS_ONLY_GROUP`, experiment scaffolding, not committed):
+(`RCEUS_ONLY_GROUP` / `RCEUS_NOMERGE`, env-gated experiment flags; inert unless set):
 
 - `new_display` is **15.7%** of merged sites but causes **93%** of the spurious
   points-to edges. Excluding it takes zoxide from **+1.91%** to **+0.12%**

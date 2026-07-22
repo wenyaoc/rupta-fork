@@ -108,6 +108,7 @@ impl<'r, 'a, 'tcx, 'compilation> PrecCritFnIdent<'r, 'a, 'tcx, 'compilation> {
         let mut groups_merged = 0usize;
         let mut sites_merged = 0usize;
         let mut per_callee: HashMap<FuncId, (usize, usize)> = HashMap::new();
+        let mut collected: Vec<(FuncId, FuncId, Vec<Location>)> = Vec::new();
 
         {
             let cg = &self.rta.call_graph;
@@ -130,6 +131,12 @@ impl<'r, 'a, 'tcx, 'compilation> PrecCritFnIdent<'r, 'a, 'tcx, 'compilation> {
                     // Only callees that actually receive a context.
                     if !self.cs_funcs.contains(&callee) {
                         continue;
+                    }
+                    // TEMP EXPERIMENT: RCEUS_NOMERGE=<substr> excludes matching callees.
+                    if let Ok(pat) = std::env::var("RCEUS_NOMERGE") {
+                        if self.rta.acx.get_function_reference(callee).to_string().contains(&pat) {
+                            continue;
+                        }
                     }
                     let param_with_flow = match self.func_pfg_map.get(&callee) {
                         Some(p) => &p.param_with_flow,
@@ -168,6 +175,7 @@ impl<'r, 'a, 'tcx, 'compilation> PrecCritFnIdent<'r, 'a, 'tcx, 'compilation> {
                     if locs.len() < 2 {
                         continue;
                     }
+                    collected.push((caller_func, _key.0, locs.clone()));
                     // RCEUS_DUMP_MERGES: per-callee tally of (groups, merged sites).
                     per_callee
                         .entry(_key.0)
@@ -187,6 +195,30 @@ impl<'r, 'a, 'tcx, 'compilation> PrecCritFnIdent<'r, 'a, 'tcx, 'compilation> {
                     }
                     groups_merged += 1;
                 }
+            }
+        }
+
+        // EXPERIMENT: RCEUS_ONLY_GROUP=<n> keeps ONLY the n-th new_display group.
+        if let Ok(nv) = std::env::var("RCEUS_ONLY_GROUP") {
+            let want: usize = nv.trim().parse().unwrap_or(usize::MAX);
+            let mut nd: Vec<&(FuncId, FuncId, Vec<Location>)> = collected
+                .iter()
+                .filter(|(_, callee, _)| {
+                    self.rta.acx.get_function_reference(*callee).to_string().contains("new_display")
+                })
+                .collect();
+            nd.sort_by_key(|(caller, callee, locs)| {
+                let m = locs.iter().map(|l| (l.block.as_usize(), l.statement_index)).min().unwrap();
+                (caller.as_usize(), callee.as_usize(), m.0, m.1)
+            });
+            eprintln!("ONLY_GROUP: {} new_display groups total", nd.len());
+            merged.clear();
+            if let Some((caller, _callee, locs)) = nd.get(want) {
+                let mut ls = locs.clone();
+                ls.sort_by_key(|l| (l.block.as_usize(), l.statement_index));
+                let canon = ls[0];
+                let m = merged.entry(*caller).or_default();
+                for l in ls.into_iter().skip(1) { m.insert(l, canon); }
             }
         }
 
