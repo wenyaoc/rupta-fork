@@ -228,6 +228,21 @@ impl<'r, 'a, 'tcx, 'compilation> PrecCritFnIdent<'r, 'a, 'tcx, 'compilation> {
             }
         }
 
+        if let Ok(path) = std::env::var("RCEUS_DUMP_GROUPS") {
+            use std::io::Write;
+            let mut w = std::fs::File::create(&path).expect("group dump");
+            writeln!(w, "size\tcallee\tcaller\tlocations").unwrap();
+            let mut v: Vec<&(FuncId, FuncId, Vec<Location>)> = collected.iter().collect();
+            v.sort_by_key(|(_, callee, locs)| (callee.as_usize(), std::cmp::Reverse(locs.len())));
+            for (caller, callee, locs) in v {
+                let cn = self.rta.acx.get_function_reference(*callee).to_string();
+                let kn = self.rta.acx.get_function_reference(*caller).to_string();
+                let ls: Vec<String> = locs.iter()
+                    .map(|l| format!("bb{}[{}]", l.block.as_usize(), l.statement_index)).collect();
+                writeln!(w, "{}\t{}\t{}\t{}", locs.len(), cn, kn, ls.join(",")).unwrap();
+            }
+        }
+
         if let Ok(path) = std::env::var("RCEUS_DUMP_MERGES") {
             use std::io::Write;
             let mut w = std::fs::File::create(&path).expect("merge dump");
