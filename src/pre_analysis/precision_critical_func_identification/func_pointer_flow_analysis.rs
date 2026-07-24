@@ -1,4 +1,4 @@
-use petgraph::graph::{DefaultIx, NodeIndex};
+use petgraph::graph::{DefaultIx, EdgeIndex, NodeIndex};
 use petgraph::Graph;
 use rustc_middle::mir;
 use rustc_hir::def_id::DefId;
@@ -34,9 +34,31 @@ impl DFGNode {
 
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// What connects two locals in the PFG.
+///
+/// A node pair can be connected by an intra-procedural assignment *and* by calls
+/// at several locations -- `let d = if c { f(a) } else { g(a) };` yields two call
+/// edges between the same pair, and `let d = if c { a } else { f(a) };` yields an
+/// intra edge and a call edge. Storing a single kind per pair silently discarded
+/// all but the first, so `cs_callsites` missed those locations and classified
+/// genuinely flow-through callsites as flow entries.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct PFGEdge {
-    pub kind: PFGEdgeEnum,
+    /// at least one intra-procedural assignment connects these locals
+    pub intra: bool,
+    /// every callsite whose argument-to-result flow connects them
+    pub call_locs: HashSet<Location>,
+}
+
+impl From<PFGEdgeEnum> for PFGEdge {
+    fn from(kind: PFGEdgeEnum) -> Self {
+        let mut e = PFGEdge::default();
+        match kind {
+            PFGEdgeEnum::IntraPFGEdge => e.intra = true,
+            PFGEdgeEnum::CallPFGEdge(l) => { e.call_locs.insert(l); }
+        }
+        e
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -45,11 +67,43 @@ pub enum PFGEdgeEnum {
     CallPFGEdge(Location)
 }
 
+/// Backward-root sets for every node of a [`FuncPFG`], precomputed by
+/// [`FuncPFG::backward_roots_table`]. O(1) per query.
+pub struct BackwardRootsTable {
+    node_of: HashMap<Rc<Path>, NodeIndex<DefaultIx>>,
+    /// node index -> component id
+    scc_of: Vec<usize>,
+    /// component id -> its backward roots, as sorted deduped node indices
+    roots: Vec<Rc<Vec<usize>>>,
+}
+
+impl BackwardRootsTable {
+    /// `None` when `path` has no node in this PFG -- provenance unknown, so its
+    /// callsite must never be merged. Every node that *is* in the PFG has a
+    /// non-empty root set, since every component traces back to some source of
+    /// the condensation, so `None` is the only degenerate case.
+    pub fn roots_of(&self, path: &Rc<Path>) -> Option<&Rc<Vec<usize>>> {
+        let n = self.node_of.get(path)?;
+        Some(&self.roots[self.scc_of[n.index()]])
+    }
+
+    /// The graph node for `path`, or `None` when it has none.
+    pub fn node(&self, path: &Rc<Path>) -> Option<NodeIndex<DefaultIx>> {
+        self.node_of.get(path).copied()
+    }
+
+    /// Roots of an already-resolved node. Always defined, since every component
+    /// traces back to some source of the condensation.
+    pub fn roots_of_node(&self, n: NodeIndex<DefaultIx>) -> &Rc<Vec<usize>> {
+        &self.roots[self.scc_of[n.index()]]
+    }
+}
+
 // === Pointer Flow Graph for a function ===
 #[derive(Clone, Debug)]
 pub struct FuncPFG {
     pub(crate) graph: Graph<DFGNode, PFGEdge>,
-    edges: HashSet<(NodeIndex<DefaultIx>, NodeIndex<DefaultIx>)>,
+    edges: HashMap<(NodeIndex<DefaultIx>, NodeIndex<DefaultIx>), EdgeIndex<DefaultIx>>,
     pub func_id: FuncId,
     // whether there is any argument-to-return flow (precision critical)
     pub has_arg_to_return_flow: bool, 
@@ -64,13 +118,15 @@ pub struct FuncPFG {
     pub cs_callsites: HashSet<Location>,
     // parameter with flow to return
     pub param_with_flow: HashSet<usize>,
-    /// Redundant flow-entry callsite merging (`--rceus-merge`). Maps a redundant
-    /// flow-entry callsite to the canonical one representing its group: the
-    /// smallest-bb callsite among the flow entries in this function that target
-    /// the same callee and whose flowing arguments reach the same backward
-    /// roots. Callsites absent from the map represent themselves. Left empty
-    /// under plain `--rceus`, so baseline behaviour is unchanged.
-    pub flow_entry_merge: HashMap<Location, Location>,
+    /// Redundant flow-entry callsite merging.
+    ///
+    /// Keyed by `(callsite, callee)`, not by callsite alone: one location can
+    /// have several callees, and each is grouped against its own siblings using
+    /// its own `param_with_flow`. Two callees at one site can therefore end up
+    /// in groups with different members and different canonical callsites,
+    /// which a location-keyed map cannot hold -- the writes chain or overwrite,
+    /// dropping a merge and leaving the result dependent on hash order.
+    pub flow_entry_merge: HashMap<(Location, FuncId), Location>,
 }
 
 
@@ -78,7 +134,7 @@ impl FuncPFG {
     pub fn new(func_id: FuncId) -> Self {
         FuncPFG {
             graph: Graph::new(),
-            edges: HashSet::new(),
+            edges: HashMap::new(),
             func_id,
             has_arg_to_return_flow: false,
             callsite_to_locals: HashMap::new(),
@@ -96,21 +152,36 @@ impl FuncPFG {
     }
 
     pub fn get_or_insert_node(&mut self, path: Rc<Path>) -> NodeIndex<DefaultIx> {
-        if let Some(node_index) = self.graph.node_indices().find(|&n| self.graph[n].path == <Path as Clone>::clone(&(*path)).into()) {
+        // Both sides are already `Rc<Path>`, so compare them directly. Cloning
+        // the `Path` into a fresh `Rc` inside the closure, as this used to,
+        // deep-copied its projection Vec and allocated an Rc once per node
+        // compared -- two allocations per candidate, on a scan that is already
+        // linear and runs twice per edge added.
+        if let Some(node_index) = self.graph.node_indices().find(|&n| self.graph[n].path == path) {
             node_index
         } else {
             self.add_node(path)
         }
     }
 
+    /// Records `kind` on the edge between `src` and `dst`, creating it if absent.
+    /// Returns whether this added information -- a new edge, a first intra
+    /// assignment, or a callsite not already recorded -- which is what the
+    /// worklist uses to decide whether to re-solve and re-enqueue.
     pub fn add_edge(&mut self, src: Rc<Path>, dst: Rc<Path>, kind: PFGEdgeEnum) -> bool {
         let src_index = self.get_or_insert_node(src);
         let dst_index = self.get_or_insert_node(dst);
-        if self.edges.insert((src_index, dst_index)) {
-            self.graph.add_edge(src_index, dst_index, PFGEdge { kind: kind.clone() });
-            return true;
+        match self.edges.get(&(src_index, dst_index)) {
+            Some(&e) => match kind {
+                PFGEdgeEnum::IntraPFGEdge => !std::mem::replace(&mut self.graph[e].intra, true),
+                PFGEdgeEnum::CallPFGEdge(l) => self.graph[e].call_locs.insert(l),
+            },
+            None => {
+                let e = self.graph.add_edge(src_index, dst_index, PFGEdge::from(kind));
+                self.edges.insert((src_index, dst_index), e);
+                true
+            }
         }
-        false
     }
 
     pub fn get_node(&self, path: &Path) -> Option<&DFGNode> {
@@ -130,46 +201,124 @@ impl FuncPFG {
         self.cs_callsites.contains(loc)
     }
 
-    /// The canonical flow-entry callsite representing `loc`'s merge group, or
-    /// `loc` itself when it is not merged (always the case under plain --rceus,
-    /// where the map is empty).
-    pub fn canonical_flow_entry(&self, loc: &Location) -> Location {
-        *self.flow_entry_merge.get(loc).unwrap_or(loc)
+    /// The canonical flow-entry callsite representing the merge group of `loc`
+    /// *as a call to `callee`*, or `loc` itself when that pair is not merged
+    /// (always the case under plain --rceus, where the map is empty).
+    pub fn canonical_flow_entry(&self, loc: &Location, callee: FuncId) -> Location {
+        *self.flow_entry_merge.get(&(*loc, callee)).unwrap_or(loc)
     }
 
-    /// The backward roots of `path`: the sources it flows from. Walks Incoming
-    /// edges back to the predecessor-less nodes and returns their indices
-    /// (sorted, deduped) — stable identifiers within this function's PFG, which
-    /// is all the merge grouping needs.
+    /// Whether `path` flows into the result of the call at `loc`, i.e. whether
+    /// the worklist added a `CallPFGEdge(loc)` out of it.
     ///
-    /// `None` means `path` has no node in this PFG. That must stay distinct from
-    /// `Some(vec![])`: an absent node means the argument's provenance is unknown,
-    /// so its callsite must never be merged with another.
-    pub fn backward_roots(&self, path: &Rc<Path>) -> Option<Vec<usize>> {
-        let start = self
-            .graph
-            .node_indices()
-            .find(|&n| self.graph[n].path == *path)?;
-        let mut seen: HashSet<NodeIndex> = HashSet::new();
-        let mut roots: Vec<usize> = Vec::new();
-        let mut q = VecDeque::new();
-        q.push_back(start);
-        while let Some(n) = q.pop_front() {
-            if !seen.insert(n) {
-                continue;
-            }
-            let mut has_pred = false;
-            for e in self.graph.edges_directed(n, petgraph::Direction::Incoming) {
-                has_pred = true;
-                q.push_back(e.source());
-            }
-            if !has_pred {
-                roots.push(n.index());
+    /// This is the pre-analysis's own record of which arguments matter at a
+    /// callsite, so reading it back keeps the merge in step with the graph. It
+    /// is not the same as testing the callee's `param_with_flow` against the
+    /// argument index: `Fn*::call*` passes the arguments as a single tuple, so
+    /// caller argument indices and callee parameter indices only correspond for
+    /// static calls. The worklist already applies that mapping when it creates
+    /// these edges.
+    ///
+    /// Answered per *location*: `add_edge` deduplicates on `(src, dst)`, so at a
+    /// callsite with several callees the edges are the union of what each
+    /// contributed. That is a superset of any one callee's flowing arguments,
+    /// which costs merges rather than creating unsound ones.
+    pub fn flows_at_callsite(&self, n: NodeIndex<DefaultIx>, loc: &Location) -> bool {
+        self.graph
+            .edges_directed(n, petgraph::Direction::Outgoing)
+            .any(|e| e.weight().call_locs.contains(loc))
+    }
+
+    /// The backward roots of every node, in one SCC + topological pass.
+    ///
+    /// A node's roots are the sources it flows from. `compute_flow_entry_merge`
+    /// needs them once per flowing argument per callsite, so answering each
+    /// query with its own traversal would repeat the same walk for every
+    /// callsite sharing a local -- exactly the case merging exists for.
+    /// Condensing first gives every node its root set in `O(V + E)`.
+    ///
+    /// Nodes of one SCC are mutually reachable, so they share a root set, and a
+    /// source of the condensation is its own root:
+    ///
+    /// ```text
+    /// roots(S) = { rep(S) }                        if S has no external predecessor
+    ///          = U_{P -> S, P != S} roots(P)       otherwise
+    /// ```
+    ///
+    /// Keying on the component rather than on predecessor-less *nodes* matters
+    /// for cycles. A node inside a cycle always has a predecessor, so a cycle
+    /// with no external entry used to contribute no root at all -- and that
+    /// empty set then propagated as an identity element through every union
+    /// downstream, so a value derived from such a cycle became
+    /// indistinguishable from one that never touched it. Treating the component
+    /// as its own root keeps them apart. A predecessor-less node is a singleton
+    /// source component whose `rep` is the node itself, so this agrees with the
+    /// old rule wherever the old rule was defined.
+    pub fn backward_roots_table(&self) -> BackwardRootsTable {
+        let n_nodes = self.graph.node_count();
+
+        let mut node_of = HashMap::with_capacity(n_nodes);
+        for n in self.graph.node_indices() {
+            node_of.insert(self.graph[n].path.clone(), n);
+        }
+
+        // tarjan_scc yields the components in reverse topological order (sinks
+        // first), so walking it backwards visits every predecessor component
+        // before its successors -- the order the propagation below needs.
+        let sccs = petgraph::algo::tarjan_scc(&self.graph);
+        let mut scc_of = vec![usize::MAX; n_nodes];
+        for (i, scc) in sccs.iter().enumerate() {
+            for n in scc {
+                scc_of[n.index()] = i;
             }
         }
-        roots.sort_unstable();
-        roots.dedup();
-        Some(roots)
+
+        let mut roots: Vec<Rc<Vec<usize>>> = vec![Rc::new(Vec::new()); sccs.len()];
+        for i in (0..sccs.len()).rev() {
+            let mut preds: Vec<usize> = Vec::new();
+            for &n in &sccs[i] {
+                for e in self.graph.edges_directed(n, petgraph::Direction::Incoming) {
+                    let p = scc_of[e.source().index()];
+                    // Intra-component edges, self-loops included, contribute
+                    // nothing: they say where a value came from within its own
+                    // cycle, not where the cycle was entered.
+                    if p != i {
+                        preds.push(p);
+                    }
+                }
+            }
+            preds.sort_unstable();
+            preds.dedup();
+
+            // A source of the condensation is its own root, named by its least
+            // node so the choice is deterministic. This covers a
+            // predecessor-less node (a singleton source) and an unentered cycle
+            // uniformly.
+            if preds.is_empty() {
+                let rep = sccs[i].iter().map(|n| n.index()).min().unwrap();
+                roots[i] = Rc::new(vec![rep]);
+                continue;
+            }
+
+            // Chain case -- a single predecessor. Share its Rc rather than
+            // rebuilding the vector, which keeps the total work linear in a long
+            // flow chain instead of quadratic.
+            if preds.len() == 1 {
+                let shared = roots[preds[0]].clone();
+                roots[i] = shared;
+                continue;
+            }
+
+            let mut acc: Vec<usize> = Vec::new();
+            for p in preds {
+                acc.extend_from_slice(&roots[p]);
+            }
+            acc.sort_unstable();
+            acc.dedup();
+            roots[i] = Rc::new(acc);
+        }
+
+        BackwardRootsTable { node_of, scc_of, roots }
     }
 
     /// Solve the reachability in the pointer flow graph.
@@ -239,7 +388,7 @@ impl FuncPFG {
             let u = e.source();
             let v = e.target();
             if from_param.contains(&u) && reaches_ret.contains(&v) {
-                if let PFGEdgeEnum::CallPFGEdge(loc) = &e.weight().kind {
+                for loc in &e.weight().call_locs {
                     self.cs_callsites.insert(*loc);
                 }
             }
@@ -259,7 +408,7 @@ impl FuncPFG {
             println!(
                 "  {:?} --{:?}--> {:?}",
                 src.path,
-                e.weight().kind,
+                e.weight(),
                 dst.path
             );
         }

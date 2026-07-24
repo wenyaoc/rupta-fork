@@ -444,6 +444,7 @@ impl RCEUSMergeCallSiteSensitive {
         inner: &mut KCallSiteSensitive,
         callsite: &Rc<CSCallSite>,
         caller_pfg: &FuncPFG,
+        callee: FuncId,
     ) -> ContextId {
         let caller_ctx = inner.get_context_by_id(callsite.func.cid);
         let caller_ctx_elem = &caller_ctx.context_elems;
@@ -454,7 +455,7 @@ impl RCEUSMergeCallSiteSensitive {
             // member of its redundant group; callsites that are their own
             // representative keep their own location, exactly as in RCEUS.
             let mut elem: BaseCallSite = callsite.into();
-            elem.location = caller_pfg.canonical_flow_entry(&callsite_location);
+            elem.location = caller_pfg.canonical_flow_entry(&callsite_location, callee);
             elem
         } else {
             // Flow-through: inherit the caller's flow entry, which is already
@@ -488,7 +489,7 @@ impl ContextStrategy for RCEUSMergeCallSiteSensitive {
     fn new_static_call_context(&mut self, callsite: &Rc<CSCallSite>, callee: FuncId) -> ContextId {
         if self.cs_funcs.contains(&callee) {
             if let Some(caller_pfg) = self.func_pfg_map.get(&callsite.func.func_id) {
-                return Self::rceus_merge_context(&mut self.inner, callsite, caller_pfg);
+                return Self::rceus_merge_context(&mut self.inner, callsite, caller_pfg, callee);
             }
         }
         self.inner.new_static_call_context(callsite, callee)
@@ -502,7 +503,7 @@ impl ContextStrategy for RCEUSMergeCallSiteSensitive {
     ) -> Option<ContextId> {
         if self.cs_funcs.contains(&callee) {
             if let Some(caller_pfg) = self.func_pfg_map.get(&callsite.func.func_id) {
-                return Some(Self::rceus_merge_context(&mut self.inner, callsite, caller_pfg));
+                return Some(Self::rceus_merge_context(&mut self.inner, callsite, caller_pfg, callee));
             }
         }
         self.inner.new_instance_call_context(callsite, receiver, callee)

@@ -68,8 +68,7 @@ fn make_options_parser() -> Command<'static> {
         .arg(Arg::new("rceus-m")
             .long("rceus-m")
             .takes_value(false)
-            .help("Enable rceus with redundant flow-entry callsite merging. \
-                   Implies --rceus."))
+            .help("Enable rceus with flow-entry callsite merging."))
         .arg(Arg::new("dump-stats")
             .long("dump-stats")
             .takes_value(false)
