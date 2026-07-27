@@ -351,7 +351,8 @@ impl<'pta, 'tcx, 'compilation, S: ContextStrategy> PointerAnalysis<'tcx, 'compil
     fn pre_analysis(&mut self) {
         let stack_filtering = self.acx.analysis_options.stack_filtering;
         let rceus = self.acx.analysis_options.rceus;
-        if !stack_filtering && !rceus {
+        let selective_cs = self.acx.analysis_options.selective_cs;
+        if !stack_filtering && !rceus && !selective_cs {
             return;
         }
         info!("Start pre-analysis");
@@ -360,7 +361,9 @@ impl<'pta, 'tcx, 'compilation, S: ContextStrategy> PointerAnalysis<'tcx, 'compil
         rta.analyze();
         self.pre_analysis_time += rta.analysis_time;
 
-        if rceus {
+        // Selective-CS needs the same precision-critical function set as RCEUS;
+        // only what it does with it differs.
+        if rceus || selective_cs {
             let mut pcfi = PrecCritFnIdent::new(&mut rta);
             pcfi.analyze();
             self.pre_analysis_time += pcfi.analysis_time;
@@ -415,10 +418,10 @@ impl<'pta, 'tcx, 'compilation, S: ContextStrategy> PointerAnalysis<'tcx, 'compil
             if new_calls.is_empty() && new_call_instances.is_empty() {
                 break;
             } else {
-                // Note: RCEUS is for call-site sensitivity only,
-                // so new call instances become normal new calls there.
+                // Note: RCEUS and selective-cs are for call-site sensitivity
+                // only, so new call instances become normal new calls there.
                 self.process_new_calls(&new_calls);
-                if !self.acx.analysis_options.rceus {
+                if !self.acx.analysis_options.rceus && !self.acx.analysis_options.selective_cs {
                     self.process_new_call_instances(&new_call_instances);
                 }
             }
@@ -429,7 +432,27 @@ impl<'pta, 'tcx, 'compilation, S: ContextStrategy> PointerAnalysis<'tcx, 'compil
     fn finalize(&self) {
         // dump call graph, points-to results
         results_dumper::dump_results(self.acx, &self.call_graph, &self.pt_data, &self.pag);
-      
+
+        // How many of the precision-critical functions the analysis actually
+        // reached. Reported here rather than in the pre-analysis because the
+        // pre-analysis set is over-approximate: it is computed from the RTA call
+        // graph, so it includes functions the main analysis never reaches.
+        if let Some(cs_funcs) = self.ctx_strategy.cs_funcs() {
+            let mut all_funcs: HashSet<FuncId> = HashSet::new();
+            let mut reached_cs_funcs: HashSet<FuncId> = HashSet::new();
+            for node in self.call_graph.graph.node_indices() {
+                if let Some(node) = self.call_graph.graph.node_weight(node) {
+                    let func_id = node.func.func_id;
+                    if all_funcs.insert(func_id) && cs_funcs.contains(&func_id) {
+                        reached_cs_funcs.insert(func_id);
+                    }
+                }
+            }
+            println!("##########################################################");
+            println!("Total functions: {}", all_funcs.len());
+            println!("Total precision-critical functions: {}", reached_cs_funcs.len());
+        }
+
         // dump pta statistics
         let pta_stat = ContextSensitiveStat::new(self);
         pta_stat.dump_stats();

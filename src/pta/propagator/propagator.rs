@@ -439,9 +439,13 @@ impl<'pta, 'tcx, 'compilation, F, P> Propagator<'pta, 'tcx, 'compilation, F, P> 
                     replaced_args,
                 ) {
                     let func_id = self.acx.get_func_id(callee_def_id, gen_args);
-                    if self.acx.analysis_options.rceus {
-                        // Since Rceus is for callsite-sensitive analyses only,
-                        // we only add the callsite for dynamic dispatch calls.
+                    if self.acx.analysis_options.rceus || self.acx.analysis_options.selective_cs {
+                        // Since Rceus and selective-cs are for callsite-sensitive
+                        // analyses only, we only add the callsite for dynamic
+                        // dispatch calls. Routing them here is what keeps them
+                        // reachable at all: process_new_call_instances is skipped
+                        // in those modes, so a call left on the instance queue is
+                        // silently dropped.
                         self.add_new_call(&dyn_callsite, &func_id);
                     } else {
                         // For other context-insensitive or object-sensitive analyses, we add the call instance
@@ -678,9 +682,9 @@ impl<'pta, 'tcx, 'compilation, F, P> Propagator<'pta, 'tcx, 'compilation, F, P> 
                             if self.tcx().is_mir_available(resolved_def_id) {
                                 // The pointee type cannot be FnDef, FnPtr, Closure, therefore its mir is supposed to be available
                                 let func_id = self.acx.get_func_id(resolved_def_id, instance_args);
-                                if self.acx.analysis_options.rceus {
-                                    // Since Rceus is for callsite-sensitive analyses only,
-                                    // we only add the callsite for dynamic dispatch calls.
+                                if self.acx.analysis_options.rceus || self.acx.analysis_options.selective_cs {
+                                    // As above: callsite-sensitive modes must take
+                                    // the call path, not the instance path.
                                     self.add_new_call(&dynamic_fntrait_callsite, &func_id);
                                 } else {
                                     // For other context-insensitive or object-sensitive analyses, we add the call instance
@@ -813,8 +817,8 @@ impl<'pta, 'tcx, 'compilation, F, P> Propagator<'pta, 'tcx, 'compilation, F, P> 
     fn propagate_cast(&mut self, cast_edge: EdgeId, propa_diff: bool) {
         let mut changed = false;
         let (src, dst) = self.pag.graph().edge_endpoints(cast_edge).unwrap();
-        let (_src_path, src_ty) = self.node_path_and_ty(src);
-        let (_dst_path, dst_ty) = self.node_path_and_ty(dst);
+        let (src_path, src_ty) = self.node_path_and_ty(src);
+        let (dst_path, dst_ty) = self.node_path_and_ty(dst);
         // debug!("Propagating cast from {:?}({:?}) -> {:?}({:?})", src_path, src_ty, dst_path, dst_ty);
         assert!(src_ty.is_any_ptr() && dst_ty.is_any_ptr());
 
@@ -884,19 +888,41 @@ impl<'pta, 'tcx, 'compilation, F, P> Propagator<'pta, 'tcx, 'compilation, F, P> 
                     }
                 } 
 
+                if type_util::is_basic_pointer(src_ty) {
+                    if let Some((_, dst_ty_rmv)) = type_util::remove_transparent_wrapper(self.acx.tcx, dst_deref_ty) {
+                        if type_util::is_basic_type(dst_ty_rmv) {
+                            // println!("  dst_deref_ty: {:?}, regularized_path: {:?}", dst_deref_ty, dst_ty_rmv);
+                            if let Some(cast_path) = regularized_path.cast_to(self.acx, dst_deref_ty) {
+                                let cast_path_id = self.pag.get_or_insert_node(&cast_path);
+                                changed |= self.pt_data.add_pts(dst, cast_path_id);
+                                continue;
+                            }
+                        }                       
+                    }
+                    
+                }
+
                 if matches!(regularized_path.value(), PathEnum::HeapObj { .. }) {
                     // For heap objects that have a concretized type, we do not let it been cast from 
                     // a simple type to other incompatible types.
                     if let Some(concre_ty) = regularized_path.concretized_heap_type(self.acx) {
                         let mut compatible_cast = false;
-                        match dst_deref_ty.kind() {
-                            TyKind::Array(elem_ty, _) | TyKind::Slice(elem_ty) => {
-                                if type_util::equal_types(self.tcx(), concre_ty, *elem_ty) {
-                                    compatible_cast = true;
+                        
+                        if src_path.regularize(self.acx) == dst_path.regularize(self.acx) {
+                            compatible_cast = true;
+                        } 
+                        else {
+                            match dst_deref_ty.kind() {
+                                TyKind::Array(elem_ty, _) | TyKind::Slice(elem_ty) => {
+                                    if type_util::equal_types(self.tcx(), concre_ty, *elem_ty) {
+                                        compatible_cast = true;
+                                    }
                                 }
+                                _ => {}
                             }
-                            _ => {}
                         }
+
+                        
                         if !compatible_cast {
                             continue;
                         }

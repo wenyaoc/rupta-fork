@@ -69,6 +69,10 @@ fn make_options_parser() -> Command<'static> {
             .long("rceus-m")
             .takes_value(false)
             .help("Enable rceus with flow-entry callsite merging."))
+        .arg(Arg::new("selective-cs")
+            .long("selective-cs")
+            .takes_value(false)
+            .help("Apply k-callsite sensitivity only to precision-critical functions."))
         .arg(Arg::new("dump-stats")
             .long("dump-stats")
             .takes_value(false)
@@ -121,6 +125,10 @@ pub struct AnalysisOptions {
     pub rceus: bool,
     /// RCEUS + merging of redundant flow-entry callsites. Implies `rceus`.
     pub rceus_m: bool,
+    /// Selective context sensitivity: plain k-callsite sensitivity, but only for
+    /// the precision-critical functions RCEUS's pre-analysis identifies. Every
+    /// other callee is analysed context-insensitively.
+    pub selective_cs: bool,
 
     pub dump_stats: bool,
     pub call_graph_output: Option<String>,
@@ -143,6 +151,7 @@ impl Default for AnalysisOptions {
             stack_filtering: false,
             rceus: false,
             rceus_m: false,
+            selective_cs: false,
             dump_stats: true,
             call_graph_output: None,
             pts_output: None,
@@ -228,6 +237,11 @@ impl AnalysisOptions {
         // Setting this before context_depth is resolved below lets --rceus-m
         // inherit the same k=0 default as --rceus.
         self.rceus = matches.contains_id("rceus") || self.rceus_m;
+        // Selective-CS reuses RCEUS's precision-critical function identification.
+        // Alone it replaces RCEUS's context augmentation with plain k-cfa on the
+        // critical callees; combined with --rceus it keeps the augmentation and
+        // instead makes NON-critical callees context-insensitive (RCEUS-SEL).
+        self.selective_cs = matches.contains_id("selective-cs");
 
         if let Some(depth) = matches.get_one::<u32>("context-depth") {
             self.context_depth = *depth;

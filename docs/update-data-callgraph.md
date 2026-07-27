@@ -7,6 +7,8 @@ paper. Every number here is **measured**, not estimated.
 
 The example is `ModuleCacheEntryInner::update_data` from **wasmtime**:
 
+
+
 ```
 benchmarks/wasmtime/crates/cache/src/lib.rs:163
 fn update_data(&self, hash: &str, serialized_data: &[u8]) -> Option<()>

@@ -49,6 +49,12 @@ pub trait ContextStrategy {
         _cs_funcs: HashSet<FuncId>,
         _func_pfg_map: HashMap<FuncId, FuncPFG>,
     ) {}
+
+    /// The precision-critical functions this strategy was handed, for the
+    /// end-of-analysis report. `None` for strategies that do not use them.
+    fn cs_funcs(&self) -> Option<&HashSet<FuncId>> {
+        None
+    }
 }
 
 pub struct ContextInsensitive {}
@@ -313,6 +319,11 @@ pub struct RCEUSCallSiteSensitive {
     inner: KCallSiteSensitive,
     cs_funcs: HashSet<FuncId>,
     func_pfg_map: HashMap<FuncId, FuncPFG>,
+    /// `--rceus --selective-cs` (RCEUS-SEL). A precision-critical callee still
+    /// gets the RCEUS-augmented context; a non-critical callee is given the
+    /// empty context instead of the k-limited one plain RCEUS would use. Plain
+    /// RCEUS keeps this `false`, so every non-critical callee is k-limited.
+    selective: bool,
 }
 
 impl RCEUSCallSiteSensitive {
@@ -321,7 +332,13 @@ impl RCEUSCallSiteSensitive {
             inner: KCallSiteSensitive::new(k),
             cs_funcs: HashSet::new(),
             func_pfg_map: HashMap::new(),
+            selective: false,
         }
+    }
+
+    /// RCEUS-SEL: as [`new`], but non-critical callees are context-insensitive.
+    pub fn new_selective(k: usize) -> Self {
+        Self { selective: true, ..Self::new(k) }
     }
 
     /// Apply the RCEUS context-augmentation algorithm using the caller's PFG.
@@ -340,13 +357,21 @@ impl RCEUSCallSiteSensitive {
         let caller_ctx_elem = &caller_ctx.context_elems;
         let callsite_location = callsite.location;
 
-        let flow_entry = if !caller_pfg.is_cs_callsite(&callsite_location) {
-            // callsite_location ⇒ 𝑓 ∉ CTXFuncs — this callsite is the flow entry.
+        // This callsite is the flow entry unless the caller is already inside a
+        // precision-critical flow and propagates its own flow entry. That holds
+        // only when the callsite lies on the caller's arg→return path
+        // (is_cs_callsite) AND the caller actually carries a context. A
+        // precision-critical caller reached as the root/entry instance has an
+        // empty context and thus no flow entry to inherit, so the flow enters here.
+        let flow_entry = if !caller_pfg.is_cs_callsite(&callsite_location)
+            || caller_ctx_elem.is_empty()
+        {
+            // callsite_location ⇒ 𝑓 ∉ CTXFuncs (or caller has no context of its
+            // own): this callsite is the flow entry.
             callsite.into()
         } else {
-            // The first element of the caller context is always the flow-entry
-            // callsite from RCEUS; the unwrap is safe because any caller reaching
-            // here has a non-empty context.
+            // The first element of the caller context is the flow-entry callsite
+            // from RCEUS; the guard above makes this unwrap safe.
             caller_ctx_elem.first().unwrap().clone()
         };
 
@@ -379,6 +404,11 @@ impl ContextStrategy for RCEUSCallSiteSensitive {
                 return Self::rceus_context(&mut self.inner, callsite, caller_pfg);
             }
         }
+        // Non-critical callee: RCEUS-SEL makes it context-insensitive; plain
+        // RCEUS keeps it k-limited.
+        if self.selective {
+            return self.inner.get_empty_context_id();
+        }
         self.inner.new_static_call_context(callsite, callee)
     }
 
@@ -393,6 +423,9 @@ impl ContextStrategy for RCEUSCallSiteSensitive {
                 return Some(Self::rceus_context(&mut self.inner, callsite, caller_pfg));
             }
         }
+        if self.selective {
+            return Some(self.inner.get_empty_context_id());
+        }
         self.inner.new_instance_call_context(callsite, receiver, callee)
     }
 
@@ -406,6 +439,101 @@ impl ContextStrategy for RCEUSCallSiteSensitive {
     fn set_prec_crit_fn_ident_data(&mut self, cs_funcs: HashSet<FuncId>, func_pfg_map: HashMap<FuncId, FuncPFG>) {
         self.cs_funcs = cs_funcs;
         self.func_pfg_map = func_pfg_map;
+    }
+
+    fn cs_funcs(&self) -> Option<&HashSet<FuncId>> {
+        Some(&self.cs_funcs)
+    }
+}
+
+
+/// Selective context sensitivity (`--selective-cs`).
+///
+/// Plain k-callsite sensitivity, but spent only where the pre-analysis says it
+/// buys precision: a callee in `cs_funcs` gets the same k-limited callsite
+/// context `KCallSiteSensitive` would give it, and every other callee is handed
+/// the empty context, i.e. analysed context-insensitively.
+///
+/// This shares RCEUS's precision-critical function identification and differs
+/// from [`RCEUSCallSiteSensitive`] only in what a critical callee's context is:
+/// RCEUS augments it with a flow-entry element derived from the caller's PFG,
+/// whereas this strategy leaves the k-limited context untouched. The PFG map is
+/// therefore not needed and is dropped on arrival.
+///
+/// Both the instance and the static case use *callsite* contexts -- selective-cs
+/// is a call-site-sensitive analysis, so a receiver never contributes a context
+/// element.
+pub struct SelectiveCallSiteSensitive {
+    inner: KCallSiteSensitive,
+    cs_funcs: HashSet<FuncId>,
+}
+
+impl SelectiveCallSiteSensitive {
+    pub fn new(k: usize) -> Self {
+        Self {
+            inner: KCallSiteSensitive::new(k),
+            cs_funcs: HashSet::new(),
+        }
+    }
+
+    /// The context for a non-critical callee: empty, so all of its callsites
+    /// share one context. Resolved through the cache rather than hardcoding id 0
+    /// so it stays correct whatever order contexts are interned in.
+    fn insensitive_context(&mut self) -> ContextId {
+        self.inner.get_empty_context_id()
+    }
+}
+
+impl ContextStrategy for SelectiveCallSiteSensitive {
+    type E = BaseCallSite;
+
+    fn empty_context(&self) -> Rc<Context<BaseCallSite>> { self.inner.empty_context() }
+    fn get_empty_context_id(&mut self) -> ContextId { self.inner.get_empty_context_id() }
+    fn get_context_id(&mut self, context: &Rc<Context<BaseCallSite>>) -> ContextId {
+        self.inner.get_context_id(context)
+    }
+    fn get_context_by_id(&self, context_id: ContextId) -> Rc<Context<BaseCallSite>> {
+        self.inner.get_context_by_id(context_id)
+    }
+    fn get_context_iter(&self) -> Option<Iter<'_, Rc<Context<BaseCallSite>>, ContextId>> {
+        self.inner.get_context_iter()
+    }
+
+    fn new_static_call_context(&mut self, callsite: &Rc<CSCallSite>, callee: FuncId) -> ContextId {
+        if self.cs_funcs.contains(&callee) {
+            self.inner.new_static_call_context(callsite, callee)
+        } else {
+            self.insensitive_context()
+        }
+    }
+
+    fn new_instance_call_context(
+        &mut self,
+        callsite: &Rc<CSCallSite>,
+        _receiver: Option<&Rc<CSPath>>,
+        callee: FuncId,
+    ) -> Option<ContextId> {
+        if self.cs_funcs.contains(&callee) {
+            // Deliberately the callsite context, not the receiver's.
+            Some(self.inner.new_context(callsite))
+        } else {
+            Some(self.insensitive_context())
+        }
+    }
+
+    fn with_stack_filter<F: SFReachable>(&mut self, stack_filter: &mut StackFilter<F>)
+    where
+        F: Copy + Into<FuncId> + std::cmp::Eq + std::hash::Hash,
+    {
+        self.inner.with_stack_filter(stack_filter);
+    }
+
+    fn set_prec_crit_fn_ident_data(&mut self, cs_funcs: HashSet<FuncId>, _func_pfg_map: HashMap<FuncId, FuncPFG>) {
+        self.cs_funcs = cs_funcs;
+    }
+
+    fn cs_funcs(&self) -> Option<&HashSet<FuncId>> {
+        Some(&self.cs_funcs)
     }
 }
 
@@ -450,10 +578,14 @@ impl RCEUSMergeCallSiteSensitive {
         let caller_ctx_elem = &caller_ctx.context_elems;
         let callsite_location = callsite.location;
 
-        let flow_entry = if !caller_pfg.is_cs_callsite(&callsite_location) {
-            // This callsite is the flow entry. Label it with the canonical
-            // member of its redundant group; callsites that are their own
-            // representative keep their own location, exactly as in RCEUS.
+        let flow_entry = if !caller_pfg.is_cs_callsite(&callsite_location)
+            || caller_ctx_elem.is_empty()
+        {
+            // This callsite is the flow entry: either it is not a cs_callsite, or
+            // the caller is a root/entry instance with an empty context and thus
+            // no flow entry to inherit. Label it with the canonical member of its
+            // redundant group; callsites that are their own representative keep
+            // their own location, exactly as in RCEUS.
             let mut elem: BaseCallSite = callsite.into();
             elem.location = caller_pfg.canonical_flow_entry(&callsite_location, callee);
             elem
@@ -519,5 +651,9 @@ impl ContextStrategy for RCEUSMergeCallSiteSensitive {
     fn set_prec_crit_fn_ident_data(&mut self, cs_funcs: HashSet<FuncId>, func_pfg_map: HashMap<FuncId, FuncPFG>) {
         self.cs_funcs = cs_funcs;
         self.func_pfg_map = func_pfg_map;
+    }
+
+    fn cs_funcs(&self) -> Option<&HashSet<FuncId>> {
+        Some(&self.cs_funcs)
     }
 }

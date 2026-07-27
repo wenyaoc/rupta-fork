@@ -85,7 +85,6 @@ impl<'r, 'a, 'tcx, 'compilation> PrecCritFnIdent<'r, 'a, 'tcx, 'compilation> {
         }
 
         self.analysis_time = now.elapsed();
-        println!("#Precision-critical functions: {}", self.cs_funcs.len());
         println!(
             "Precision-critical function identification time: {}",
             humantime::format_duration(self.analysis_time).to_string()
@@ -98,13 +97,8 @@ impl<'r, 'a, 'tcx, 'compilation> PrecCritFnIdent<'r, 'a, 'tcx, 'compilation> {
         type GroupKey = (FuncId, Vec<(usize, Vec<usize>)>);
 
         let mut merged: HashMap<FuncId, HashMap<(Location, FuncId), Location>> = HashMap::new();
-
-        // TEMP DIAG: compute both candidate filters and classify where they differ.
-        let diag = std::env::var("RCEUS_DIAG").is_ok();
-        let mut d_tot = 0usize;                       // candidate (loc, callee) pairs
-        let mut d_diff: HashMap<String, usize> = HashMap::new();
-        let mut d_merged_a = 0usize;                  // sites merged under param_with_flow
-        let mut d_merged_b = 0usize;                  // sites merged under edges
+        // callsites eliminated by merging, and the number of equivalence classes
+        let (mut n_sites, mut n_groups) = (0usize, 0usize);
 
         {
             let cg = &self.rta.call_graph;
@@ -119,14 +113,6 @@ impl<'r, 'a, 'tcx, 'compilation> PrecCritFnIdent<'r, 'a, 'tcx, 'compilation> {
                 // without ever needing a root.
                 let mut roots_table: Option<BackwardRootsTable> = None;
                 let mut groups: HashMap<GroupKey, Vec<Location>> = HashMap::new();
-                let mut groups_a: HashMap<GroupKey, Vec<Location>> = HashMap::new();
-                // how many callees each callsite in this caller resolves to
-                let mut callees_at: HashMap<Location, usize> = HashMap::new();
-                if diag {
-                    for e in cg.graph.edges_directed(caller_node, petgraph::Direction::Outgoing) {
-                        *callees_at.entry(*e.weight().callsite.get_location()).or_insert(0) += 1;
-                    }
-                }
                 for e in cg.graph.edges_directed(caller_node, petgraph::Direction::Outgoing) {
                     let loc = *e.weight().callsite.get_location();
                     // Flow entries only: a flow-through callsite inherits its
@@ -167,36 +153,6 @@ impl<'r, 'a, 'tcx, 'compilation> PrecCritFnIdent<'r, 'a, 'tcx, 'compilation> {
                         }
                         key_parts.push((*arg_idx, table.roots_of_node(n).as_ref().clone()));
                     }
-                    if diag {
-                        d_tot += 1;
-                        let pwf = self.func_pfg_map.get(&callee).map(|p| &p.param_with_flow);
-                        let mut key_a: Vec<(usize, Vec<usize>)> = Vec::new();
-                        for (arg_idx, arg_path) in args {
-                            let inc = pwf.map_or(false, |p| p.contains(arg_idx));
-                            if !inc { continue; }
-                            if let Some(n) = table.node(arg_path) {
-                                key_a.push((*arg_idx, table.roots_of_node(n).as_ref().clone()));
-                            }
-                        }
-                        key_a.sort();
-                        let pos_a: Vec<usize> = key_a.iter().map(|(i, _)| *i).collect();
-                        let mut kp = key_parts.clone();
-                        kp.sort();
-                        let pos_b: Vec<usize> = kp.iter().map(|(i, _)| *i).collect();
-                        if pos_a != pos_b {
-                            let kind = if caller_pfg.static_callsites.contains(&loc) { "static" }
-                                else if caller_pfg.closure_dyn_callsites.contains(&loc) { "closure_dyn" }
-                                else if caller_pfg.fn_ptr_def_callsites.contains(&loc) { "fnptr" }
-                                else { "unclassified" };
-                            let multi = if callees_at.get(&loc).copied().unwrap_or(1) > 1 { "multi" } else { "single" };
-                            let dir = if pos_b.len() > pos_a.len() { "B-extra" }
-                                else if pos_b.len() < pos_a.len() { "B-missing" } else { "B-shifted" };
-                            *d_diff.entry(format!("{kind:12} {multi:6} {dir}")).or_insert(0) += 1;
-                        }
-                        if !key_a.is_empty() {
-                            groups_a.entry((callee, key_a)).or_default().push(loc);
-                        }
-                    }
                     if key_parts.is_empty() {
                         continue;
                     }
@@ -204,11 +160,6 @@ impl<'r, 'a, 'tcx, 'compilation> PrecCritFnIdent<'r, 'a, 'tcx, 'compilation> {
                     groups.entry((callee, key_parts)).or_default().push(loc);
                 }
 
-                if diag {
-                    for (_, locs) in &groups_a {
-                        if locs.len() >= 2 { d_merged_a += locs.len() - 1; }
-                    }
-                }
                 for ((callee, _), mut locs) in groups {
                     if locs.len() < 2 {
                         continue;
@@ -217,6 +168,8 @@ impl<'r, 'a, 'tcx, 'compilation> PrecCritFnIdent<'r, 'a, 'tcx, 'compilation> {
                     // is deterministic when one block holds several.
                     locs.sort_by_key(|l| (l.block.as_usize(), l.statement_index));
                     let canonical = locs[0];
+                    n_groups += 1;
+                    n_sites += locs.len() - 1;
                     let m = merged.entry(caller_func).or_default();
                     for l in locs.into_iter().skip(1) {
                         // Keyed by callee too: a location with several callees is
@@ -228,18 +181,8 @@ impl<'r, 'a, 'tcx, 'compilation> PrecCritFnIdent<'r, 'a, 'tcx, 'compilation> {
             }
         }
 
-        if diag {
-            for m in merged.values() { d_merged_b += m.len(); }
-            println!("=== RCEUS_DIAG ===");
-            println!("candidate (loc,callee) pairs : {d_tot}");
-            println!("merged sites, param_with_flow: {d_merged_a}");
-            println!("merged sites, edge-derived   : {d_merged_b}");
-            let mut v: Vec<_> = d_diff.iter().collect();
-            v.sort_by(|a, b| b.1.cmp(a.1));
-            println!("divergent candidates by class:");
-            for (k, n) in v { println!("  {n:>8}  {k}"); }
-            println!("=== END RCEUS_DIAG ===");
-        }
+        println!("#Merged flow-entry sites: {n_sites}");
+        println!("#Merge groups: {n_groups}");
 
         for (func_id, map) in merged {
             if let Some(pfg) = self.func_pfg_map.get_mut(&func_id) {
