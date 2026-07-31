@@ -40,6 +40,13 @@ pub struct RapidTypeAnalysis<'a, 'tcx, 'compilation> {
 
     pub num_stmts: usize,
 
+    /// Per-definition reachable-LOC and MIR-statement counts, keyed by DefId so
+    /// a generic counted at several monomorphizations contributes once. Only
+    /// populated when RCEUS_LOC_COUNT is set. `def_loc` counts distinct source
+    /// lines the def's MIR touches; `def_stmt_count` counts its MIR statements.
+    pub def_loc: HashMap<DefId, usize>,
+    pub def_stmt_count: HashMap<DefId, usize>,
+
     pub analysis_time: Duration,
 }
 
@@ -62,8 +69,43 @@ impl<'a, 'tcx, 'compilation> RapidTypeAnalysis<'a, 'tcx, 'compilation> {
             fnptr_sig_to_possible_targets: HashMap::new(),
             trait_upcasting_relations: HashMap::new(),
             num_stmts: 0,
+            def_loc: HashMap::new(),
+            def_stmt_count: HashMap::new(),
             analysis_time: Duration::ZERO,
         }
+    }
+
+    /// Distinct source lines and MIR statements of one MIR body. Source lines
+    /// are resolved through the SourceMap, so library and std bodies count the
+    /// same way as the benchmark's own -- and a line touched by several
+    /// statements counts once (per-file dedup). `source_callsite` attributes a
+    /// macro-expanded line to the macro's invocation site.
+    fn count_loc_stmts(tcx: TyCtxt<'tcx>, mir: &rustc_middle::mir::Body<'tcx>) -> (usize, usize) {
+        use std::collections::{BTreeMap, BTreeSet};
+        use rustc_span::FileName;
+        let sm = tcx.sess.source_map();
+        let mut per_file: BTreeMap<FileName, BTreeSet<usize>> = BTreeMap::new();
+        let mut num_stmts = 0usize;
+        for bb in mir.basic_blocks.indices() {
+            let bbd = &mir.basic_blocks[bb];
+            num_stmts += bbd.statements.len() + 1; // + terminator
+            let mut spans: Vec<rustc_span::Span> =
+                bbd.statements.iter().map(|s| s.source_info.span).collect();
+            if let Some(term) = &bbd.terminator {
+                spans.push(term.source_info.span);
+            }
+            for span in spans {
+                let span = span.source_callsite();
+                if let Ok(lines) = sm.span_to_lines(span) {
+                    let file = sm.lookup_source_file(span.lo()).name.clone();
+                    let set = per_file.entry(file).or_default();
+                    for line in lines.lines {
+                        set.insert(line.line_index + 1);
+                    }
+                }
+            }
+        }
+        (per_file.values().map(|s| s.len()).sum(), num_stmts)
     }
 
     #[inline]
@@ -85,9 +127,20 @@ impl<'a, 'tcx, 'compilation> RapidTypeAnalysis<'a, 'tcx, 'compilation> {
         self.analysis_time = now.elapsed();
         println!("Rapid Type Analysis completed.");
         println!(
-            "Rapid Type Analysis time: {}", 
+            "Rapid Type Analysis time: {}",
             humantime::format_duration(self.analysis_time).to_string()
         );
+
+        // RTA-reachable LOC/stmts. LOC is deduplicated by def (Col 3 metric).
+        // #Stmts matches rupta's "Number of statements analyzed": accumulated
+        // during RTA body-visiting (self.num_stmts), so each func_id counts the
+        // statements of the *actual* MIR it visited -- a promoted/static body
+        // counts its own small MIR, not the parent def's optimized_mir.
+        if std::env::var("RCEUS_LOC_COUNT").is_ok() {
+            let rta_loc: usize = self.def_loc.values().sum();
+            println!("#RTA analyzed Loc: {}", rta_loc);
+            println!("#RTA analyzed stmts: {}", self.num_stmts);
+        }
 
     }
 
@@ -122,6 +175,14 @@ impl<'a, 'tcx, 'compilation> RapidTypeAnalysis<'a, 'tcx, 'compilation> {
                 
                 self.promote_constants(def_id, generic_args);
                 let mir = self.tcx().optimized_mir(def_id);
+
+                // RCEUS_LOC_COUNT: record this def's LOC/stmts once. Keyed by
+                // def_id, so monomorphizations share the entry.
+                if std::env::var("RCEUS_LOC_COUNT").is_ok() && !self.def_loc.contains_key(&def_id) {
+                    let (loc, stmts) = Self::count_loc_stmts(self.tcx(), mir);
+                    self.def_loc.insert(def_id, loc);
+                    self.def_stmt_count.insert(def_id, stmts);
+                }
 
                 let mut bv = BodyVisitor::new(self, func_id, mir);
                 bv.visit_body();

@@ -3,7 +3,7 @@
 // This source code is licensed under the GNU license found in the
 // LICENSE file in the root directory of this source tree.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, HashMap};
 use std::fmt::{Debug, Formatter, Result};
 use std::rc::Rc;
 use std::time::Duration;
@@ -11,6 +11,7 @@ use std::time::Duration;
 use itertools::Itertools;
 use log::*;
 use rustc_middle::ty::TyCtxt;
+use rustc_hir::def_id::DefId;
 use super::*;
 use super::strategies::context_strategy::{ContextStrategy, KObjectSensitive};
 use super::strategies::stack_filtering::StackFilter;
@@ -63,6 +64,12 @@ pub struct ContextSensitivePTA<'pta, 'tcx, 'compilation, S: ContextStrategy> {
     pub stack_filter: Option<StackFilter<CSFuncId>>,
 
     pub pre_analysis_time: Duration,
+
+    /// Per-def LOC/stmt maps taken from RTA; summed over the final call graph
+    /// in `finalize` to report LOC/stmts reachable under this analysis. Only
+    /// populated when RCEUS_LOC_COUNT is set.
+    def_loc_count: HashMap<DefId, usize>,
+    def_stmt_count: HashMap<DefId, usize>,
 }
 
 impl<'pta, 'tcx, 'compilation, S: ContextStrategy> Debug for ContextSensitivePTA<'pta, 'tcx, 'compilation, S> {
@@ -91,6 +98,8 @@ impl<'pta, 'tcx, 'compilation, S: ContextStrategy> ContextSensitivePTA<'pta, 'tc
             ctx_strategy,
             stack_filter: None,
             pre_analysis_time: Duration::ZERO,
+            def_loc_count: HashMap::new(),
+            def_stmt_count: HashMap::new(),
         }
     }
 
@@ -361,6 +370,11 @@ impl<'pta, 'tcx, 'compilation, S: ContextStrategy> PointerAnalysis<'tcx, 'compil
         rta.analyze();
         self.pre_analysis_time += rta.analysis_time;
 
+        // Carry RTA's per-def LOC/stmt maps forward so finalize can sum them
+        // over the final (this-analysis-reachable) call graph.
+        self.def_loc_count = std::mem::take(&mut rta.def_loc);
+        self.def_stmt_count = std::mem::take(&mut rta.def_stmt_count);
+
         // Selective-CS needs the same precision-critical function set as RCEUS;
         // only what it does with it differs.
         if rceus || selective_cs {
@@ -451,6 +465,35 @@ impl<'pta, 'tcx, 'compilation, S: ContextStrategy> PointerAnalysis<'tcx, 'compil
             println!("##########################################################");
             println!("Total functions: {}", all_funcs.len());
             println!("Total precision-critical functions: {}", reached_cs_funcs.len());
+        }
+
+        // LOC/stmts reachable under this analysis: sum the per-def maps over the
+        // final (pointer-analysis) call graph. LOC is deduped by def (Col 3,
+        // distinct source lines); stmts is per monomorphized instance -- deduped
+        // by func_id, not def (Col 4, MIR statements after monomorphization).
+        if std::env::var("RCEUS_LOC_COUNT").is_ok() {
+            let mut total_loc = 0usize;
+            let mut total_stmt = 0usize;
+            let mut seen_def: HashSet<DefId> = HashSet::new();
+            let mut seen_func: HashSet<FuncId> = HashSet::new();
+            for node in self.call_graph.graph.node_indices() {
+                if let Some(node) = self.call_graph.graph.node_weight(node) {
+                    let func_id = node.func.func_id;
+                    let def_id = self.acx.get_function_reference(func_id).def_id;
+                    if seen_def.insert(def_id) {
+                        if let Some(l) = self.def_loc_count.get(&def_id) {
+                            total_loc += l;
+                        }
+                    }
+                    if seen_func.insert(func_id) {
+                        if let Some(s) = self.def_stmt_count.get(&def_id) {
+                            total_stmt += s;
+                        }
+                    }
+                }
+            }
+            println!("#RCEUS analyzed Loc: {}", total_loc);
+            println!("#RCEUS analyzed stmts: {}", total_stmt);
         }
 
         // dump pta statistics
