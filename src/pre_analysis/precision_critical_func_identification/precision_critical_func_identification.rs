@@ -99,6 +99,10 @@ impl<'r, 'a, 'tcx, 'compilation> PrecCritFnIdent<'r, 'a, 'tcx, 'compilation> {
         let mut merged: HashMap<FuncId, HashMap<(Location, FuncId), Location>> = HashMap::new();
         // callsites eliminated by merging, and the number of equivalence classes
         let (mut n_sites, mut n_groups) = (0usize, 0usize);
+        // (caller, callee, callsite locations) for each merge group; only kept
+        // when RCEUS_DUMP_GROUPS is set (see the dump below).
+        let dump_groups = std::env::var("RCEUS_DUMP_GROUPS").ok();
+        let mut collected: Vec<(FuncId, FuncId, Vec<Location>)> = Vec::new();
 
         {
             let cg = &self.rta.call_graph;
@@ -130,6 +134,24 @@ impl<'r, 'a, 'tcx, 'compilation> PrecCritFnIdent<'r, 'a, 'tcx, 'compilation> {
                     // contexts carry no points-to consequence.
                     if !self.func_pfg_map.contains_key(&callee) {
                         continue;
+                    }
+                    // EXPERIMENT: RCEUS_NOMERGE=<substr>[,<substr>...] excludes a
+                    // callsite from flow-entry merging when the listed substring
+                    // matches either the callee (e.g. new_display) or the caller
+                    // (e.g. keymap::default::default, where the loss is inside the
+                    // caller). Comma-separated; inert when unset.
+                    if let Ok(pats) = std::env::var("RCEUS_NOMERGE") {
+                        let callee_name = self.rta.acx.get_function_reference(callee).to_string();
+                        let caller_name = self.rta.acx.get_function_reference(caller_func).to_string();
+                        if let Some(p) = pats.split(',').find(|p| !p.is_empty()
+                            && (callee_name.contains(p) || caller_name.contains(p))) {
+                            if std::env::var("RCEUS_NOMERGE_DUMP").is_ok() {
+                                let side = if callee_name.contains(p) { "callee" } else { "caller" };
+                                eprintln!("NOMERGE-HIT pat={} {}={}", p, side,
+                                    if side == "callee" { &callee_name } else { &caller_name });
+                            }
+                            continue;
+                        }
                     }
                     let (args, _dest) = match caller_pfg.callsite_to_locals.get(&loc) {
                         Some(x) => x,
@@ -170,6 +192,9 @@ impl<'r, 'a, 'tcx, 'compilation> PrecCritFnIdent<'r, 'a, 'tcx, 'compilation> {
                     let canonical = locs[0];
                     n_groups += 1;
                     n_sites += locs.len() - 1;
+                    if dump_groups.is_some() {
+                        collected.push((caller_func, callee, locs.clone()));
+                    }
                     let m = merged.entry(caller_func).or_default();
                     for l in locs.into_iter().skip(1) {
                         // Keyed by callee too: a location with several callees is
@@ -183,6 +208,25 @@ impl<'r, 'a, 'tcx, 'compilation> PrecCritFnIdent<'r, 'a, 'tcx, 'compilation> {
 
         println!("#Merged flow-entry sites: {n_sites}");
         println!("#Merge groups: {n_groups}");
+
+        // RCEUS_DUMP_GROUPS=<path>: one row per merge group
+        //   size = #callsites in the group (size-1 are eliminated)
+        //   callee, caller, callsite locations.
+        // Rows sorted by group size, largest first -- i.e. the callsites merged
+        // the most. Inert unless the env var is set.
+        if let Some(path) = dump_groups {
+            use std::io::Write;
+            let mut w = std::fs::File::create(&path).expect("group dump");
+            writeln!(w, "size\tcallee\tcaller\tlocations").unwrap();
+            collected.sort_by_key(|(_, _, locs)| std::cmp::Reverse(locs.len()));
+            for (caller, callee, locs) in &collected {
+                let cn = self.rta.acx.get_function_reference(*callee).to_string();
+                let kn = self.rta.acx.get_function_reference(*caller).to_string();
+                let ls: Vec<String> = locs.iter()
+                    .map(|l| format!("bb{}[{}]", l.block.as_usize(), l.statement_index)).collect();
+                writeln!(w, "{}\t{}\t{}\t{}", locs.len(), cn, kn, ls.join(",")).unwrap();
+            }
+        }
 
         for (func_id, map) in merged {
             if let Some(pfg) = self.func_pfg_map.get_mut(&func_id) {

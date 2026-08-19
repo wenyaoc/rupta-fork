@@ -333,32 +333,27 @@ pub fn dump_func_contexts(acx: &AnalysisContext, call_graph: &CSCallGraph, ctx_s
         _ => Box::new(File::create(func_ctxts_path).expect("Unable to create file")) as Box<dyn Write>,
     });
 
+    // Per function: the set of distinct contexts (= calling contexts) it is
+    // reached under. Keyed by FuncId; different monomorphizations share the same
+    // human-readable name, so callers that aggregate by name must sum these.
     let mut func_ctxts_map: HashMap<FuncId, HashSet<ContextId>> = HashMap::new();
     for cs_func in call_graph.reach_funcs_iter() {
         func_ctxts_map.entry(cs_func.func_id).or_default().insert(cs_func.cid);
     }
-    
-    // Sort and print the func_ctxts_map
+
+    // Compact output: one line per function, sorted by descending context count.
+    // Only the count is written (the full context tuples are enormous on large
+    // benchmarks and are not needed for the context-per-function statistics).
+    let _ = ctx_strategy;
     let mut sorted_func_ctxts: Vec<(&FuncId, &HashSet<ContextId>)> = func_ctxts_map.iter().collect();
-    sorted_func_ctxts.sort_by(|a, b| a.1.len().cmp(&b.1.len()));
+    sorted_func_ctxts.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
     for (func_id, ctxts) in sorted_func_ctxts {
         let func_ref = acx.get_function_reference(*func_id);
-        let has_self_parameter = util::has_self_parameter(acx.tcx, func_ref.def_id);
-        let has_self_ref_parameter = util::has_self_ref_parameter(acx.tcx, func_ref.def_id);
-        let ctxts: HashSet<Rc<Context<_>>> = ctxts.iter().map(|ctxt_id| ctx_strategy.get_context_by_id(*ctxt_id)).collect();
         func_ctxts_writer
             .write_all(
-                format!(
-                    "{:?}, has_self_param: {:?}, has_self_ref_param: {:?}, #ctxts: {:?} \n",
-                    func_ref.to_string(),
-                    has_self_parameter,
-                    has_self_ref_parameter,
-                    ctxts.len()
-                )
-                .as_bytes(),
+                format!("{}\t{:?}\n", ctxts.len(), func_ref.to_string()).as_bytes(),
             )
             .expect("Unable to write data");
-        func_ctxts_writer.write_all(format!("\t{:?}\n", ctxts).as_bytes()).expect("Unable to write data");
     }
 }
 

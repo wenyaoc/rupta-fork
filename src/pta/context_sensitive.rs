@@ -475,6 +475,13 @@ impl<'pta, 'tcx, 'compilation, S: ContextStrategy> PointerAnalysis<'tcx, 'compil
         // dump call graph, points-to results
         results_dumper::dump_results(self.acx, &self.call_graph, &self.pt_data, &self.pag);
 
+        // dump per-function context counts
+        if let Some(func_ctxts_output) = &self.acx.analysis_options.func_ctxts_output {
+            results_dumper::dump_func_contexts(
+                self.acx, &self.call_graph, &self.ctx_strategy, func_ctxts_output,
+            );
+        }
+
         // How many of the precision-critical functions the analysis actually
         // reached. Reported here rather than in the pre-analysis because the
         // pre-analysis set is over-approximate: it is computed from the RTA call

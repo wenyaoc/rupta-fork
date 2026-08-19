@@ -89,6 +89,10 @@ fn make_options_parser() -> Command<'static> {
             .long("dump-mir")
             .takes_value(true)
             .help("Dump the mir of reachable functions to the output file."))
+        .arg(Arg::new("func-ctxts-output")
+            .long("dump-func-ctxts")
+            .takes_value(true)
+            .help("Dump per-function context counts to the output file."))
         .arg(Arg::new("unsafe-stats-output")
             .long("dump-unsafe-stats")
             .takes_value(true)
@@ -253,6 +257,7 @@ impl AnalysisOptions {
         self.call_graph_output = matches.get_one::<String>("call-graph-output").cloned();
         self.pts_output = matches.get_one::<String>("pts-output").cloned();
         self.mir_output = matches.get_one::<String>("mir-output").cloned();
+        self.func_ctxts_output = matches.get_one::<String>("func-ctxts-output").cloned();
         self.unsafe_stat_output = matches.get_one::<String>("unsafe-stats-output").cloned();
         self.dyn_calls_output = matches.get_one::<String>("dyn-calls-output").cloned();
         self.type_indices_output = matches.get_one::<String>("type-indices-output").cloned();
