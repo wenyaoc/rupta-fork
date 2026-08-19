@@ -50,6 +50,11 @@ pub trait ContextStrategy {
         _func_pfg_map: HashMap<FuncId, FuncPFG>,
     ) {}
 
+    /// Library-ablation (RCEUS_LIB_MODE): treat the given set of functions as
+    /// precision-critical instead of running the pre-analysis. Flow entries are
+    /// the user->library boundary (a callsite whose caller is not in the set).
+    fn set_library_mode(&mut self, _library_funcs: HashSet<FuncId>) {}
+
     /// The precision-critical functions this strategy was handed, for the
     /// end-of-analysis report. `None` for strategies that do not use them.
     fn cs_funcs(&self) -> Option<&HashSet<FuncId>> {
@@ -324,6 +329,10 @@ pub struct RCEUSCallSiteSensitive {
     /// empty context instead of the k-limited one plain RCEUS would use. Plain
     /// RCEUS keeps this `false`, so every non-critical callee is k-limited.
     selective: bool,
+    /// Library-ablation mode (RCEUS_LIB_MODE). When `Some`, the pre-analysis is
+    /// skipped: `cs_funcs` is the library-function set, and a callsite is a flow
+    /// entry iff its caller is not in this set (the user->library boundary).
+    library_funcs: Option<HashSet<FuncId>>,
 }
 
 impl RCEUSCallSiteSensitive {
@@ -333,7 +342,34 @@ impl RCEUSCallSiteSensitive {
             cs_funcs: HashSet::new(),
             func_pfg_map: HashMap::new(),
             selective: false,
+            library_funcs: None,
         }
+    }
+
+    /// Library-ablation context: like `rceus_context`, but a callsite is a flow
+    /// entry iff its caller is not a library function (the user->library
+    /// boundary), rather than by the PFG's `is_cs_callsite`.
+    fn library_context(
+        inner: &mut KCallSiteSensitive,
+        callsite: &Rc<CSCallSite>,
+        library_funcs: &HashSet<FuncId>,
+    ) -> ContextId {
+        let caller_ctx = inner.get_context_by_id(callsite.func.cid);
+        let caller_ctx_elem = &caller_ctx.context_elems;
+        let flow_entry = if !library_funcs.contains(&callsite.func.func_id)
+            || caller_ctx_elem.is_empty()
+        {
+            // caller is not library (or has no context of its own): the flow
+            // enters the library here.
+            callsite.into()
+        } else {
+            caller_ctx_elem.first().unwrap().clone()
+        };
+        let mut new_callee_ctx_elem = vec![flow_entry];
+        let callee_ctx = Context::new_k_limited_context(&caller_ctx, callsite.into(), inner.k);
+        new_callee_ctx_elem.extend(callee_ctx.context_elems.iter().cloned());
+        let new_callee_ctx = Rc::new(Context { context_elems: new_callee_ctx_elem });
+        inner.ctx_cache.get_context_id(&new_callee_ctx)
     }
 
     /// RCEUS-SEL: as [`new`], but non-critical callees are context-insensitive.
@@ -400,6 +436,9 @@ impl ContextStrategy for RCEUSCallSiteSensitive {
 
     fn new_static_call_context(&mut self, callsite: &Rc<CSCallSite>, callee: FuncId) -> ContextId {
         if self.cs_funcs.contains(&callee) {
+            if let Some(lib) = self.library_funcs.as_ref() {
+                return Self::library_context(&mut self.inner, callsite, lib);
+            }
             if let Some(caller_pfg) = self.func_pfg_map.get(&callsite.func.func_id) {
                 return Self::rceus_context(&mut self.inner, callsite, caller_pfg);
             }
@@ -419,6 +458,9 @@ impl ContextStrategy for RCEUSCallSiteSensitive {
         callee: FuncId,
     ) -> Option<ContextId> {
         if self.cs_funcs.contains(&callee) {
+            if let Some(lib) = self.library_funcs.as_ref() {
+                return Some(Self::library_context(&mut self.inner, callsite, lib));
+            }
             if let Some(caller_pfg) = self.func_pfg_map.get(&callsite.func.func_id) {
                 return Some(Self::rceus_context(&mut self.inner, callsite, caller_pfg));
             }
@@ -439,6 +481,11 @@ impl ContextStrategy for RCEUSCallSiteSensitive {
     fn set_prec_crit_fn_ident_data(&mut self, cs_funcs: HashSet<FuncId>, func_pfg_map: HashMap<FuncId, FuncPFG>) {
         self.cs_funcs = cs_funcs;
         self.func_pfg_map = func_pfg_map;
+    }
+
+    fn set_library_mode(&mut self, library_funcs: HashSet<FuncId>) {
+        self.cs_funcs = library_funcs.clone();
+        self.library_funcs = Some(library_funcs);
     }
 
     fn cs_funcs(&self) -> Option<&HashSet<FuncId>> {

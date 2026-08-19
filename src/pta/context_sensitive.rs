@@ -378,12 +378,40 @@ impl<'pta, 'tcx, 'compilation, S: ContextStrategy> PointerAnalysis<'tcx, 'compil
         // Selective-CS needs the same precision-critical function set as RCEUS;
         // only what it does with it differs.
         if rceus || selective_cs {
-            let mut pcfi = PrecCritFnIdent::new(&mut rta);
-            pcfi.analyze();
-            self.pre_analysis_time += pcfi.analysis_time;
-            let cs_funcs = std::mem::take(&mut pcfi.cs_funcs);
-            let func_pfg_map = std::mem::take(&mut pcfi.func_pfg_map);
-            self.ctx_strategy.set_prec_crit_fn_ident_data(cs_funcs, func_pfg_map);
+            // Library ablation (RCEUS_LIB_MODE=std|all): skip the pre-analysis
+            // and instead treat all library functions as precision-critical.
+            // "std" = crate in {std, core, alloc}; "all" = every non-local crate.
+            if let Ok(mode) = std::env::var("RCEUS_LIB_MODE") {
+                let now = std::time::Instant::now();
+                let func_ids: Vec<FuncId> =
+                    rta.call_graph.func_nodes.keys().copied().collect();
+                let tcx = rta.acx.tcx;
+                let mut lib: HashSet<FuncId> = HashSet::new();
+                for fid in func_ids {
+                    let def_id = rta.acx.get_function_reference(fid).def_id;
+                    let is_lib = match mode.as_str() {
+                        "all" => !def_id.is_local(),
+                        "std" => matches!(
+                            tcx.crate_name(def_id.krate).as_str(),
+                            "std" | "core" | "alloc"
+                        ),
+                        _ => false,
+                    };
+                    if is_lib {
+                        lib.insert(fid);
+                    }
+                }
+                self.pre_analysis_time += now.elapsed();
+                println!("#Library precision-critical functions ({}): {}", mode, lib.len());
+                self.ctx_strategy.set_library_mode(lib);
+            } else {
+                let mut pcfi = PrecCritFnIdent::new(&mut rta);
+                pcfi.analyze();
+                self.pre_analysis_time += pcfi.analysis_time;
+                let cs_funcs = std::mem::take(&mut pcfi.cs_funcs);
+                let func_pfg_map = std::mem::take(&mut pcfi.func_pfg_map);
+                self.ctx_strategy.set_prec_crit_fn_ident_data(cs_funcs, func_pfg_map);
+            }
         }
 
         if stack_filtering {
