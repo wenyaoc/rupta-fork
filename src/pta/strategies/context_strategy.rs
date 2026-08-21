@@ -828,9 +828,21 @@ impl RCEUSArgProvSensitive {
             for e in &caller_ctx.context_elems {
                 if let ProvElem::ParamProv(p, s) = e { caller_map.insert(*p, s.clone()); }
             }
+            // Only record provenance for callee parameters that reach the
+            // callee's return (mirrors the Case-2 seed). A parameter that does
+            // not reach g's return produces "dead" provenance: it can only
+            // propagate to other non-return-reaching parameters and never
+            // reaches any output boundary, so tracking it would add contexts
+            // without refining any return/callee points-to set.
+            let callee_flow = func_pfg_map.get(&callee).map(|p| &p.param_with_flow);
             if let Some(argreach) = arg_param_reach.get(&caller_func).and_then(|m| m.get(&loc)) {
                 let mut prov: Vec<(u32, Vec<u32>)> = Vec::new();
                 for (arg_idx, caller_params) in argreach {
+                    if let Some(gf) = callee_flow {
+                        if !gf.contains(arg_idx) {
+                            continue;
+                        }
+                    }
                     let mut set: BTreeSet<u32> = BTreeSet::new();
                     for cp in caller_params {
                         if let Some(s) = caller_map.get(cp) {
