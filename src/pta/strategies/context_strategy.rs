@@ -24,6 +24,46 @@ use super::stack_filtering::{StackFilter, SFReachable};
 use crate::pre_analysis::precision_critical_func_identification::func_pointer_flow_analysis::FuncPFG;
 
 
+// EXPERIMENT (env RCEUS_ARGPROV_TAG): record which branch of argprov_context
+// produced each interned context, so a dump can classify bare vs seeded Sites.
+// Bitmask per ContextId (a context can be produced by several branches):
+//   bit0 case2-seeded  bit1 case2-pfg-but-empty  bit2 case2-nopfg
+//   bit3 case3-inherited-prov  bit4 case3-inherited-BARE
+//   bit5 case3-fallback-prov   bit6 case3-fallback-BARE
+thread_local! {
+    static ARGPROV_BRANCH: std::cell::RefCell<HashMap<ContextId, u8>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+fn argprov_record_branch(cid: ContextId, code: u8) {
+    if std::env::var("RCEUS_ARGPROV_TAG").is_ok() {
+        ARGPROV_BRANCH.with(|m| {
+            *m.borrow_mut().entry(cid).or_insert(0) |= 1u8 << code;
+        });
+    }
+}
+/// Bitmask of branches that produced context `cid`, or None if never recorded.
+pub fn argprov_ctx_branch(cid: ContextId) -> Option<u8> {
+    ARGPROV_BRANCH.with(|m| m.borrow().get(&cid).copied())
+}
+
+// EXPERIMENT (env RCEUS_ARGPROV_DIAG): why did a case3-inherit-BARE happen?
+thread_local! {
+    static ARGPROV_DIAG: std::cell::RefCell<HashMap<String, u64>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+fn argprov_diag(key: String) {
+    if std::env::var("RCEUS_ARGPROV_DIAG").is_ok() {
+        ARGPROV_DIAG.with(|m| *m.borrow_mut().entry(key).or_insert(0) += 1);
+    }
+}
+pub fn argprov_diag_report() -> Vec<(String, u64)> {
+    ARGPROV_DIAG.with(|m| {
+        let mut v: Vec<(String, u64)> = m.borrow().iter().map(|(k, n)| (k.clone(), *n)).collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v
+    })
+}
+
 pub trait ContextStrategy {
     type E: ContextElement;
     fn empty_context(&self) -> Rc<Context<Self::E>>;
@@ -798,17 +838,16 @@ impl RCEUSArgProvSensitive {
         let is_flow_entry = !caller_pfg.is_cs_callsite(&loc);
 
         let mut elems: Vec<ProvElem> = Vec::new();
+        let mut c2_haspfg = false;
+        let mut c3_fallback = false;
 
         if is_flow_entry {
             // callee is a fresh flow-entry function: its params ARE the entry args
-            // (identity provenance).
+            // (identity provenance). Only params that reach the return, since only
+            // those can propagate through a downstream flow-through callsite.
             elems.push(ProvElem::Site(BaseCallSite::new(caller_func, loc)));
             if let Some(pfg) = func_pfg_map.get(&callee) {
-                // Only params that reach the return: these are exactly the ones
-                // that can propagate through a downstream flow-through (cs_)
-                // callsite, so they are the correct entry-arg set. (A param that
-                // feeds a flow-through arg is pulled into param_with_flow by
-                // construction; params outside it never propagate provenance.)
+                c2_haspfg = true;
                 let mut params: Vec<u32> = pfg.param_with_flow.iter().map(|p| *p as u32).collect();
                 params.sort();
                 for p in params {
@@ -821,7 +860,7 @@ impl RCEUSArgProvSensitive {
             // provenance (initial arg number, not the current position).
             let site = match caller_ctx.context_elems.first() {
                 Some(ProvElem::Site(s)) => *s,
-                _ => BaseCallSite::new(caller_func, loc),
+                _ => { c3_fallback = true; BaseCallSite::new(caller_func, loc) }
             };
             elems.push(ProvElem::Site(site));
             let mut caller_map: HashMap<u32, Vec<u32>> = HashMap::new();
@@ -835,14 +874,28 @@ impl RCEUSArgProvSensitive {
             // reaches any output boundary, so tracking it would add contexts
             // without refining any return/callee points-to set.
             let callee_flow = func_pfg_map.get(&callee).map(|p| &p.param_with_flow);
+            // The param_with_flow filter (drop callee params that don't reach the
+            // callee's return) only makes sense on STATIC calls, where the caller
+            // argument index equals the callee parameter ordinal. For closure/dyn/
+            // fn-ptr calls the real arguments are packed into a tuple, so caller
+            // arg indices and callee param ordinals do not correspond (see the
+            // worklist's dispatch handling in precision_critical_func_identification.rs);
+            // applying the filter there wrongly drops the tuple's provenance.
+            let apply_filter = caller_pfg.static_callsites.contains(&loc);
+            let (mut any_arg, mut any_passed, mut any_reaching) = (false, false, false);
             if let Some(argreach) = arg_param_reach.get(&caller_func).and_then(|m| m.get(&loc)) {
                 let mut prov: Vec<(u32, Vec<u32>)> = Vec::new();
                 for (arg_idx, caller_params) in argreach {
-                    if let Some(gf) = callee_flow {
-                        if !gf.contains(arg_idx) {
-                            continue;
+                    any_arg = true;
+                    if apply_filter {
+                        if let Some(gf) = callee_flow {
+                            if !gf.contains(arg_idx) {
+                                continue;
+                            }
                         }
                     }
+                    any_passed = true;
+                    if !caller_params.is_empty() { any_reaching = true; }
                     let mut set: BTreeSet<u32> = BTreeSet::new();
                     for cp in caller_params {
                         if let Some(s) = caller_map.get(cp) {
@@ -858,10 +911,48 @@ impl RCEUSArgProvSensitive {
                     elems.push(ProvElem::ParamProv(p, s));
                 }
             }
+            // Diagnose why a bare (no-provenance) Case-3 context arose.
+            if !c3_fallback
+                && elems.iter().all(|e| matches!(e, ProvElem::Site(_)))
+                && std::env::var("RCEUS_ARGPROV_DIAG").is_ok()
+            {
+                let disp = if caller_pfg.static_callsites.contains(&loc) {
+                    "static"
+                } else if caller_pfg.closure_dyn_callsites.contains(&loc) {
+                    "closuredyn"
+                } else {
+                    "other"
+                };
+                let reason = if !any_arg {
+                    "A_no_argreach"
+                } else if !any_passed {
+                    "B_all_filtered"
+                } else if !any_reaching {
+                    "C_arg_is_local"
+                } else if caller_map.is_empty() {
+                    "D_cascade_caller_bare"
+                } else {
+                    "E_reaching_but_unmapped"
+                };
+                argprov_diag(format!("{}|{}", disp, reason));
+            }
         }
 
+        let n_prov = elems.iter().filter(|e| matches!(e, ProvElem::ParamProv(..))).count();
+        let code = if is_flow_entry {
+            if !c2_haspfg { 2 } else if n_prov == 0 { 1 } else { 0 }
+        } else {
+            match (c3_fallback, n_prov > 0) {
+                (false, true) => 3,
+                (false, false) => 4,
+                (true, true) => 5,
+                (true, false) => 6,
+            }
+        };
         let ctx = Rc::new(Context { context_elems: elems });
-        cache.get_context_id(&ctx)
+        let cid = cache.get_context_id(&ctx);
+        argprov_record_branch(cid, code);
+        cid
     }
 }
 
