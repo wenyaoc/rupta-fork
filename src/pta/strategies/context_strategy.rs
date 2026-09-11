@@ -24,46 +24,6 @@ use super::stack_filtering::{StackFilter, SFReachable};
 use crate::pre_analysis::precision_critical_func_identification::func_pointer_flow_analysis::FuncPFG;
 
 
-// EXPERIMENT (env RCEUS_ARGPROV_TAG): record which branch of argprov_context
-// produced each interned context, so a dump can classify bare vs seeded Sites.
-// Bitmask per ContextId (a context can be produced by several branches):
-//   bit0 case2-seeded  bit1 case2-pfg-but-empty  bit2 case2-nopfg
-//   bit3 case3-inherited-prov  bit4 case3-inherited-BARE
-//   bit5 case3-fallback-prov   bit6 case3-fallback-BARE
-thread_local! {
-    static ARGPROV_BRANCH: std::cell::RefCell<HashMap<ContextId, u8>> =
-        std::cell::RefCell::new(HashMap::new());
-}
-fn argprov_record_branch(cid: ContextId, code: u8) {
-    if std::env::var("RCEUS_ARGPROV_TAG").is_ok() {
-        ARGPROV_BRANCH.with(|m| {
-            *m.borrow_mut().entry(cid).or_insert(0) |= 1u8 << code;
-        });
-    }
-}
-/// Bitmask of branches that produced context `cid`, or None if never recorded.
-pub fn argprov_ctx_branch(cid: ContextId) -> Option<u8> {
-    ARGPROV_BRANCH.with(|m| m.borrow().get(&cid).copied())
-}
-
-// EXPERIMENT (env RCEUS_ARGPROV_DIAG): why did a case3-inherit-BARE happen?
-thread_local! {
-    static ARGPROV_DIAG: std::cell::RefCell<HashMap<String, u64>> =
-        std::cell::RefCell::new(HashMap::new());
-}
-fn argprov_diag(key: String) {
-    if std::env::var("RCEUS_ARGPROV_DIAG").is_ok() {
-        ARGPROV_DIAG.with(|m| *m.borrow_mut().entry(key).or_insert(0) += 1);
-    }
-}
-pub fn argprov_diag_report() -> Vec<(String, u64)> {
-    ARGPROV_DIAG.with(|m| {
-        let mut v: Vec<(String, u64)> = m.borrow().iter().map(|(k, n)| (k.clone(), *n)).collect();
-        v.sort_by(|a, b| b.1.cmp(&a.1));
-        v
-    })
-}
-
 pub trait ContextStrategy {
     type E: ContextElement;
     fn empty_context(&self) -> Rc<Context<Self::E>>;
@@ -92,6 +52,13 @@ pub trait ContextStrategy {
         _cs_funcs: HashSet<FuncId>,
         _func_pfg_map: HashMap<FuncId, FuncPFG>,
     ) {}
+
+    /// ABLATION hook (argprov only): flow-entry callees whose provenance seeding
+    /// should be suppressed. Default no-op.
+    fn set_noprov_callees(&mut self, _callees: HashSet<FuncId>) {}
+
+    /// ABLATION: restrict `set_noprov_callees` to these flow-entry Site funcs.
+    fn set_noprov_sites(&mut self, _sites: HashSet<FuncId>) {}
 
     /// Library-ablation (RCEUS_LIB_MODE): treat the given set of functions as
     /// precision-critical instead of running the pre-analysis. Flow entries are
@@ -479,6 +446,13 @@ impl ContextStrategy for RCEUSCallSiteSensitive {
 
     fn new_static_call_context(&mut self, callsite: &Rc<CSCallSite>, callee: FuncId) -> ContextId {
         if self.cs_funcs.contains(&callee) {
+            // Specially-handled callee: in cs_funcs but has no PFG body (its
+            // effect is summarised inline as arg->result edges in the caller's
+            // PFG). Its points-to is context-independent, so give it the empty
+            // context rather than a flow-entry callsite context.
+            if !self.func_pfg_map.contains_key(&callee) {
+                return self.inner.get_empty_context_id();
+            }
             if let Some(lib) = self.library_funcs.as_ref() {
                 return Self::library_context(&mut self.inner, callsite, lib);
             }
@@ -501,6 +475,11 @@ impl ContextStrategy for RCEUSCallSiteSensitive {
         callee: FuncId,
     ) -> Option<ContextId> {
         if self.cs_funcs.contains(&callee) {
+            // Specially-handled callee (in cs_funcs, no PFG body): context-
+            // independent inline summary, so give it the empty context.
+            if !self.func_pfg_map.contains_key(&callee) {
+                return Some(self.inner.get_empty_context_id());
+            }
             if let Some(lib) = self.library_funcs.as_ref() {
                 return Some(Self::library_context(&mut self.inner, callsite, lib));
             }
@@ -710,6 +689,13 @@ impl ContextStrategy for RCEUSMergeCallSiteSensitive {
 
     fn new_static_call_context(&mut self, callsite: &Rc<CSCallSite>, callee: FuncId) -> ContextId {
         if self.cs_funcs.contains(&callee) {
+            // Specially-handled callee: in cs_funcs but has no PFG body (its
+            // effect is summarised inline as arg->result edges in the caller's
+            // PFG). Its points-to is context-independent, so give it the empty
+            // context, exactly as RCEUS does.
+            if !self.func_pfg_map.contains_key(&callee) {
+                return self.inner.get_empty_context_id();
+            }
             if let Some(caller_pfg) = self.func_pfg_map.get(&callsite.func.func_id) {
                 return Self::rceus_merge_context(&mut self.inner, callsite, caller_pfg, callee);
             }
@@ -724,6 +710,11 @@ impl ContextStrategy for RCEUSMergeCallSiteSensitive {
         callee: FuncId,
     ) -> Option<ContextId> {
         if self.cs_funcs.contains(&callee) {
+            // Specially-handled callee (in cs_funcs, no PFG body): context-
+            // independent inline summary, so give it the empty context.
+            if !self.func_pfg_map.contains_key(&callee) {
+                return Some(self.inner.get_empty_context_id());
+            }
             if let Some(caller_pfg) = self.func_pfg_map.get(&callsite.func.func_id) {
                 return Some(Self::rceus_merge_context(&mut self.inner, callsite, caller_pfg, callee));
             }
@@ -776,6 +767,27 @@ pub struct RCEUSArgProvSensitive {
     func_pfg_map: HashMap<FuncId, FuncPFG>,
     /// caller func -> callsite loc -> [(arg index, caller param ordinals reaching it)]
     arg_param_reach: ArgParamReach,
+    /// ABLATION (env ARGPROV_NOPROV=<name substr>): flow-entry callees for which
+    /// provenance seeding is suppressed -- they get the plain RCEUS `[Site]`
+    /// context, so their whole flow-through subtree carries no provenance. Used to
+    /// measure how much precision a specific flow entry's provenance contributes.
+    noprov_callees: HashSet<FuncId>,
+    /// ABLATION (env ARGPROV_NOPROV_SITE): if non-empty, `noprov_callees`
+    /// suppression only applies when the context's flow-entry Site's function is
+    /// in this set -- i.e. ablate a callee's provenance ONLY under specific flow
+    /// entries. Empty = apply everywhere.
+    noprov_sites: HashSet<FuncId>,
+}
+
+/// The callee's flow-carrying parameter indices (its `param_with_flow`), used to
+/// seed its identity provenance. `argprov_context` is only reached for PFG
+/// callees (the dispatch sends specially-handled/no-PFG callees straight to the
+/// empty context), so a missing PFG yields no params.
+fn callee_flow_params(func_pfg_map: &HashMap<FuncId, FuncPFG>, callee: FuncId) -> Vec<u32> {
+    func_pfg_map
+        .get(&callee)
+        .map(|pfg| pfg.param_with_flow.iter().map(|p| *p as u32).collect())
+        .unwrap_or_default()
 }
 
 impl RCEUSArgProvSensitive {
@@ -785,6 +797,8 @@ impl RCEUSArgProvSensitive {
             cs_funcs: HashSet::new(),
             func_pfg_map: HashMap::new(),
             arg_param_reach: HashMap::new(),
+            noprov_callees: HashSet::new(),
+            noprov_sites: HashSet::new(),
         }
     }
 
@@ -828,6 +842,8 @@ impl RCEUSArgProvSensitive {
         cache: &mut ContextCache<ProvElem>,
         func_pfg_map: &HashMap<FuncId, FuncPFG>,
         arg_param_reach: &ArgParamReach,
+        noprov_callees: &HashSet<FuncId>,
+        noprov_sites: &HashSet<FuncId>,
         callsite: &Rc<CSCallSite>,
         caller_pfg: &FuncPFG,
         callee: FuncId,
@@ -838,21 +854,28 @@ impl RCEUSArgProvSensitive {
         let is_flow_entry = !caller_pfg.is_cs_callsite(&loc);
 
         let mut elems: Vec<ProvElem> = Vec::new();
-        let mut c2_haspfg = false;
-        let mut c3_fallback = false;
 
         if is_flow_entry {
-            // callee is a fresh flow-entry function: its params ARE the entry args
-            // (identity provenance). Only params that reach the return, since only
-            // those can propagate through a downstream flow-through callsite.
+            // Case 2 (flow entry): the callee's params ARE the entry args
+            // (identity provenance). A callee with no flow-carrying params is a
+            // specially-handled function with context-independent points-to, so
+            // it gets the empty context -- exactly RCEUS's treatment of it.
+            let mut params = callee_flow_params(func_pfg_map, callee);
+            params.sort();
+            params.dedup();
+            if params.is_empty() {
+                return cache.get_context_id(&Context::new_empty());
+            }
             elems.push(ProvElem::Site(BaseCallSite::new(caller_func, loc)));
-            if let Some(pfg) = func_pfg_map.get(&callee) {
-                c2_haspfg = true;
-                let mut params: Vec<u32> = pfg.param_with_flow.iter().map(|p| *p as u32).collect();
-                params.sort();
-                for p in params {
-                    elems.push(ProvElem::ParamProv(p, vec![p]));
-                }
+            // ABLATION: suppress provenance for this flow-entry callee -> plain
+            // RCEUS `[Site]`; the whole flow-through subtree then carries none.
+            if noprov_callees.contains(&callee)
+                && (noprov_sites.is_empty() || noprov_sites.contains(&caller_func)) {
+                let ctx = Rc::new(Context { context_elems: elems });
+                return cache.get_context_id(&ctx);
+            }
+            for p in params {
+                elems.push(ProvElem::ParamProv(p, vec![p]));
             }
         } else {
             // flow-through: inherit the flow-entry site; map each callee param to
@@ -860,50 +883,71 @@ impl RCEUSArgProvSensitive {
             // provenance (initial arg number, not the current position).
             let site = match caller_ctx.context_elems.first() {
                 Some(ProvElem::Site(s)) => *s,
-                _ => { c3_fallback = true; BaseCallSite::new(caller_func, loc) }
+                _ => BaseCallSite::new(caller_func, loc),
             };
             elems.push(ProvElem::Site(site));
-            let mut caller_map: HashMap<u32, Vec<u32>> = HashMap::new();
-            for e in &caller_ctx.context_elems {
-                if let ProvElem::ParamProv(p, s) = e { caller_map.insert(*p, s.clone()); }
+            // ABLATION: suppress provenance for this callee -> plain RCEUS
+            // `[Site]` (inherited flow entry, no ParamProv appended).
+            if noprov_callees.contains(&callee)
+                && (noprov_sites.is_empty() || noprov_sites.contains(&site.func)) {
+                let ctx = Rc::new(Context { context_elems: elems });
+                return cache.get_context_id(&ctx);
             }
-            // Only record provenance for callee parameters that reach the
-            // callee's return (mirrors the Case-2 seed). A parameter that does
-            // not reach g's return produces "dead" provenance: it can only
-            // propagate to other non-return-reaching parameters and never
-            // reaches any output boundary, so tracking it would add contexts
-            // without refining any return/callee points-to set.
-            let callee_flow = func_pfg_map.get(&callee).map(|p| &p.param_with_flow);
-            // The param_with_flow filter (drop callee params that don't reach the
-            // callee's return) only makes sense on STATIC calls, where the caller
-            // argument index equals the callee parameter ordinal. For closure/dyn/
-            // fn-ptr calls the real arguments are packed into a tuple, so caller
-            // arg indices and callee param ordinals do not correspond (see the
-            // worklist's dispatch handling in precision_critical_func_identification.rs);
-            // applying the filter there wrongly drops the tuple's provenance.
-            let apply_filter = caller_pfg.static_callsites.contains(&loc);
-            let (mut any_arg, mut any_passed, mut any_reaching) = (false, false, false);
-            if let Some(argreach) = arg_param_reach.get(&caller_func).and_then(|m| m.get(&loc)) {
-                let mut prov: Vec<(u32, Vec<u32>)> = Vec::new();
-                for (arg_idx, caller_params) in argreach {
-                    any_arg = true;
-                    if apply_filter {
-                        if let Some(gf) = callee_flow {
-                            if !gf.contains(arg_idx) {
-                                continue;
+            // Provenance refinement applies only to callees with a PFG. A
+            // specially-handled callee (no PFG) has its effect summarised inline
+            // as arg->result edges in the caller's PFG -- there is no callee body
+            // or param-ordinal space to refine -- so it just follows RCEUS: the
+            // bare `[Site]` (falls through to the normal return below).
+            if let Some(cpfg) = func_pfg_map.get(&callee) {
+                let mut caller_map: HashMap<u32, Vec<u32>> = HashMap::new();
+                for e in &caller_ctx.context_elems {
+                    if let ProvElem::ParamProv(p, s) = e { caller_map.insert(*p, s.clone()); }
+                }
+                // Fold the caller's per-parameter provenance onto each CALLER
+                // ARGUMENT: arg_prov[a] = union of entry-arg sets over the caller
+                // parameters that reach argument a.
+                let mut arg_prov: HashMap<u32, BTreeSet<u32>> = HashMap::new();
+                if let Some(argreach) = arg_param_reach.get(&caller_func).and_then(|m| m.get(&loc)) {
+                    for (arg_idx, caller_params) in argreach {
+                        let entry = arg_prov.entry(*arg_idx as u32).or_default();
+                        for cp in caller_params {
+                            if let Some(s) = caller_map.get(cp) {
+                                for e in s { entry.insert(*e); }
                             }
                         }
                     }
-                    any_passed = true;
-                    if !caller_params.is_empty() { any_reaching = true; }
-                    let mut set: BTreeSet<u32> = BTreeSet::new();
-                    for cp in caller_params {
-                        if let Some(s) = caller_map.get(cp) {
-                            for e in s { set.insert(*e); }
-                        }
-                    }
+                }
+                // Map caller-argument provenance onto CALLEE PARAMETER ordinals,
+                // mirroring the dispatch handling in the worklist (see
+                // precision_critical_func_identification.rs):
+                //   static      : callee param i   <- caller arg i        (1-1)
+                //   closure/dyn : callee param 1   <- caller arg 1 (receiver)
+                //                 callee param j>=2 <- caller arg 2 (tuple)
+                //   fnptr/other : callee param j   <- caller arg 2 (tuple, all params)
+                // Only callee parameters that reach the callee's return carry
+                // provenance (mirrors the Case-2 seed): a parameter that does not
+                // reach g's return produces "dead" provenance that never reaches
+                // an output boundary, so tracking it would add contexts without
+                // refining any return/callee points-to set.
+                let is_static = caller_pfg.static_callsites.contains(&loc);
+                let is_closure_dyn = caller_pfg.closure_dyn_callsites.contains(&loc);
+                let empty: BTreeSet<u32> = BTreeSet::new();
+                let mut callee_params: Vec<u32> =
+                    cpfg.param_with_flow.iter().map(|x| *x as u32).collect();
+                callee_params.sort();
+                callee_params.dedup();
+                let mut prov: Vec<(u32, Vec<u32>)> = Vec::new();
+                for cp in callee_params {
+                    let set: &BTreeSet<u32> = if is_static {
+                        arg_prov.get(&cp).unwrap_or(&empty)
+                    } else if is_closure_dyn {
+                        if cp == 1 { arg_prov.get(&1).unwrap_or(&empty) }
+                        else { arg_prov.get(&2).unwrap_or(&empty) }
+                    } else {
+                        arg_prov.get(&2).unwrap_or(&empty)
+                    };
                     if !set.is_empty() {
-                        prov.push((*arg_idx as u32, set.into_iter().collect()));
+                        prov.push((cp, set.iter().copied().collect()));
                     }
                 }
                 prov.sort();
@@ -911,48 +955,15 @@ impl RCEUSArgProvSensitive {
                     elems.push(ProvElem::ParamProv(p, s));
                 }
             }
-            // Diagnose why a bare (no-provenance) Case-3 context arose.
-            if !c3_fallback
-                && elems.iter().all(|e| matches!(e, ProvElem::Site(_)))
-                && std::env::var("RCEUS_ARGPROV_DIAG").is_ok()
-            {
-                let disp = if caller_pfg.static_callsites.contains(&loc) {
-                    "static"
-                } else if caller_pfg.closure_dyn_callsites.contains(&loc) {
-                    "closuredyn"
-                } else {
-                    "other"
-                };
-                let reason = if !any_arg {
-                    "A_no_argreach"
-                } else if !any_passed {
-                    "B_all_filtered"
-                } else if !any_reaching {
-                    "C_arg_is_local"
-                } else if caller_map.is_empty() {
-                    "D_cascade_caller_bare"
-                } else {
-                    "E_reaching_but_unmapped"
-                };
-                argprov_diag(format!("{}|{}", disp, reason));
-            }
         }
 
-        let n_prov = elems.iter().filter(|e| matches!(e, ProvElem::ParamProv(..))).count();
-        let code = if is_flow_entry {
-            if !c2_haspfg { 2 } else if n_prov == 0 { 1 } else { 0 }
-        } else {
-            match (c3_fallback, n_prov > 0) {
-                (false, true) => 3,
-                (false, false) => 4,
-                (true, true) => 5,
-                (true, false) => 6,
-            }
-        };
+        // Return RCEUS's flow-entry Site plus any argprov provenance appended
+        // above. When no provenance was added this is a bare `[Site]` -- the pure
+        // RCEUS context (a Case-3 flow-through of a local-origin value, or a
+        // no-PFG specially-handled callee): the flow-entry Site still separates
+        // the call per-entry exactly as RCEUS would.
         let ctx = Rc::new(Context { context_elems: elems });
-        let cid = cache.get_context_id(&ctx);
-        argprov_record_branch(cid, code);
-        cid
+        cache.get_context_id(&ctx)
     }
 }
 
@@ -975,9 +986,15 @@ impl ContextStrategy for RCEUSArgProvSensitive {
 
     fn new_static_call_context(&mut self, callsite: &Rc<CSCallSite>, callee: FuncId) -> ContextId {
         if self.cs_funcs.contains(&callee) {
+            // A specially-handled callee (no PFG) has its effect inlined into the
+            // caller's PFG, so its own context never refines anything: RCEUS gives
+            // it the empty context and argprov appends no provenance -> empty.
+            if !self.func_pfg_map.contains_key(&callee) {
+                return self.get_empty_context_id();
+            }
             if let Some(caller_pfg) = self.func_pfg_map.get(&callsite.func.func_id) {
                 return Self::argprov_context(
-                    &mut self.ctx_cache, &self.func_pfg_map, &self.arg_param_reach,
+                    &mut self.ctx_cache, &self.func_pfg_map, &self.arg_param_reach, &self.noprov_callees, &self.noprov_sites,
                     callsite, caller_pfg, callee);
             }
         }
@@ -991,9 +1008,13 @@ impl ContextStrategy for RCEUSArgProvSensitive {
         callee: FuncId,
     ) -> Option<ContextId> {
         if self.cs_funcs.contains(&callee) {
+            // Specially-handled callee (no PFG): empty context (see the static case).
+            if !self.func_pfg_map.contains_key(&callee) {
+                return Some(self.get_empty_context_id());
+            }
             if let Some(caller_pfg) = self.func_pfg_map.get(&callsite.func.func_id) {
                 return Some(Self::argprov_context(
-                    &mut self.ctx_cache, &self.func_pfg_map, &self.arg_param_reach,
+                    &mut self.ctx_cache, &self.func_pfg_map, &self.arg_param_reach, &self.noprov_callees, &self.noprov_sites,
                     callsite, caller_pfg, callee));
             }
         }
@@ -1009,6 +1030,14 @@ impl ContextStrategy for RCEUSArgProvSensitive {
         self.cs_funcs = cs_funcs;
         self.func_pfg_map = func_pfg_map;
         self.arg_param_reach = reach;
+    }
+
+    fn set_noprov_callees(&mut self, callees: HashSet<FuncId>) {
+        self.noprov_callees = callees;
+    }
+
+    fn set_noprov_sites(&mut self, sites: HashSet<FuncId>) {
+        self.noprov_sites = sites;
     }
 }
 

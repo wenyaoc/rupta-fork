@@ -410,6 +410,35 @@ impl<'pta, 'tcx, 'compilation, S: ContextStrategy> PointerAnalysis<'tcx, 'compil
                 self.pre_analysis_time += pcfi.analysis_time;
                 let cs_funcs = std::mem::take(&mut pcfi.cs_funcs);
                 let func_pfg_map = std::mem::take(&mut pcfi.func_pfg_map);
+                // ABLATION (env ARGPROV_NOPROV=<name substr>): suppress provenance
+                // for flow-entry callees whose name matches, to measure that
+                // entry's contribution. Resolve names here where acx is available.
+                if let Ok(pat) = std::env::var("ARGPROV_NOPROV") {
+                    // ';'-separated substrings; a callee matches if its name
+                    // contains any of them (allows names with internal commas).
+                    let pats: Vec<&str> = pat.split(';').filter(|p| !p.is_empty()).collect();
+                    let mut noprov = std::collections::HashSet::new();
+                    for &fid in &cs_funcs {
+                        let nm = rta.acx.get_function_reference(fid).to_string();
+                        if pats.iter().any(|p| nm.contains(p)) {
+                            noprov.insert(fid);
+                        }
+                    }
+                    println!("#ARGPROV_NOPROV '{}' matched {} callees", pat, noprov.len());
+                    self.ctx_strategy.set_noprov_callees(noprov);
+                    // Optional restriction: only ablate under flow entries whose
+                    // Site function name matches ARGPROV_NOPROV_SITE (';'-separated).
+                    if let Ok(spat) = std::env::var("ARGPROV_NOPROV_SITE") {
+                        let sp: Vec<&str> = spat.split(';').filter(|p| !p.is_empty()).collect();
+                        let mut sites = std::collections::HashSet::new();
+                        for &fid in &cs_funcs {
+                            let nm = rta.acx.get_function_reference(fid).to_string();
+                            if sp.iter().any(|p| nm.contains(p)) { sites.insert(fid); }
+                        }
+                        println!("#ARGPROV_NOPROV_SITE '{}' matched {} site funcs", spat, sites.len());
+                        self.ctx_strategy.set_noprov_sites(sites);
+                    }
+                }
                 self.ctx_strategy.set_prec_crit_fn_ident_data(cs_funcs, func_pfg_map);
             }
         }
@@ -474,6 +503,7 @@ impl<'pta, 'tcx, 'compilation, S: ContextStrategy> PointerAnalysis<'tcx, 'compil
     fn finalize(&self) {
         // dump call graph, points-to results
         results_dumper::dump_results(self.acx, &self.call_graph, &self.pt_data, &self.pag);
+
 
         // dump per-function context counts
         if let Some(func_ctxts_output) = &self.acx.analysis_options.func_ctxts_output {

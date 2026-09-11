@@ -8,19 +8,17 @@ use petgraph::visit::EdgeRef;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::rc::Rc;
 
 use crate::graph::pag::{PAGNodeId, PAG, PAGPath};
 use crate::graph::call_graph::{CallGraph, CGFunction, CGCallSite, CSCallGraph};
 use crate::mir::call_site::{BaseCallSite, CallType};
-use crate::mir::context::{Context, ContextId};
+use crate::mir::context::ContextId;
 use crate::mir::function::FuncId;
 use crate::mir::analysis_context::AnalysisContext;
 use crate::mir::path::PathEnum;
 use crate::pta::DiffPTDataTy;
 use crate::pta::strategies::context_strategy::ContextStrategy;
 use crate::pts_set::points_to::PointsToSet;
-use crate::util;
 
 pub fn dump_results<P: PAGPath, F, S>(
     acx: &AnalysisContext, 
@@ -327,7 +325,7 @@ fn dump_dyn_calls_(
     }
 }
 
-pub fn dump_func_contexts(acx: &AnalysisContext, call_graph: &CSCallGraph, ctx_strategy: &impl ContextStrategy, func_ctxts_path: &String) {
+pub fn dump_func_contexts(acx: &AnalysisContext, call_graph: &CSCallGraph, _ctx_strategy: &impl ContextStrategy, func_ctxts_path: &String) {
     let mut func_ctxts_writer = BufWriter::new(match &func_ctxts_path[..] {
         "stdout" => Box::new(std::io::stdout()) as Box<dyn Write>,
         _ => Box::new(File::create(func_ctxts_path).expect("Unable to create file")) as Box<dyn Write>,
@@ -344,10 +342,6 @@ pub fn dump_func_contexts(acx: &AnalysisContext, call_graph: &CSCallGraph, ctx_s
     // Compact output: one line per function, sorted by descending context count.
     // Only the count is written (the full context tuples are enormous on large
     // benchmarks and are not needed for the context-per-function statistics).
-    // RCEUS_DUMP_CTX_FN=<substr>[,<substr>...]: for functions whose name matches
-    // any substring, also dump the full contents of every context they are
-    // analysed under (Debug of the context elements), sorted for determinism.
-    let dump_ctx_fn = std::env::var("RCEUS_DUMP_CTX_FN").ok();
     let mut sorted_func_ctxts: Vec<(&FuncId, &HashSet<ContextId>)> = func_ctxts_map.iter().collect();
     sorted_func_ctxts.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
     for (func_id, ctxts) in sorted_func_ctxts {
@@ -356,38 +350,6 @@ pub fn dump_func_contexts(acx: &AnalysisContext, call_graph: &CSCallGraph, ctx_s
         func_ctxts_writer
             .write_all(format!("{}\t{:?}\n", ctxts.len(), name).as_bytes())
             .expect("Unable to write data");
-        if let Some(pats) = &dump_ctx_fn {
-            if pats.split(',').any(|p| !p.is_empty() && name.contains(p)) {
-                let mut lines: Vec<String> = ctxts
-                    .iter()
-                    .map(|cid| {
-                        let tag = crate::pta::strategies::context_strategy::argprov_ctx_branch(*cid)
-                            .map(|m| format!("[br={:07b}] ", m))
-                            .unwrap_or_default();
-                        format!("{}{:?}", tag, ctx_strategy.get_context_by_id(*cid))
-                    })
-                    .collect();
-                lines.sort();
-                for l in lines {
-                    func_ctxts_writer
-                        .write_all(format!("\tCTX {}\n", l).as_bytes())
-                        .expect("Unable to write data");
-                }
-            }
-        }
-    }
-
-    // RCEUS_ARGPROV_DIAG: reasons bare Case-3 contexts arose (dispatch|reason).
-    let diag = crate::pta::strategies::context_strategy::argprov_diag_report();
-    if !diag.is_empty() {
-        func_ctxts_writer
-            .write_all(b"\n#ARGPROV-BARE-DIAG (dispatch|reason => count)\n")
-            .expect("write");
-        for (k, n) in diag {
-            func_ctxts_writer
-                .write_all(format!("  {k} => {n}\n").as_bytes())
-                .expect("write");
-        }
     }
 }
 
