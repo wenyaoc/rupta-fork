@@ -7,6 +7,7 @@ use rustc_middle::mir::Location;
 
 use crate::graph::call_graph::{CGCallSite, CGNodeId};
 use crate::mir::function::FuncId;
+use crate::mir::path::{Path, PathSelector};
 use crate::pre_analysis::rta::rta::RapidTypeAnalysis;
 
 use super::func_pointer_flow_analysis::{
@@ -159,21 +160,74 @@ impl<'r, 'a, 'tcx, 'compilation> PrecCritFnIdent<'r, 'a, 'tcx, 'compilation> {
                     };
 
                     // Key on the roots of the arguments that flow into this
-                    // call's result. Which those are is read back off the PFG
-                    // rather than recomputed from the callee's param_with_flow:
-                    // the worklist already applied the tuple mapping that
-                    // closure/dyn and fn-pointer calls need, and an argument
-                    // carrying such an edge necessarily has a node, so its roots
-                    // are always defined.
+                    // call's result. RCEUS-M-AP uses logical tuple fields for
+                    // Fn-lowered calls so swapping two fields cannot make two
+                    // distinct AP entries look merge-equivalent.
                     let table = roots_table
                         .get_or_insert_with(|| caller_pfg.backward_roots_table());
                     let mut key_parts: Vec<(usize, Vec<usize>)> = Vec::new();
-                    for (arg_idx, arg_path) in args {
-                        let Some(n) = table.node(arg_path) else { continue };
-                        if !caller_pfg.flows_at_callsite(n, &loc) {
+
+                    let is_fn_lowered = caller_pfg.fn_ptr_def_callsites.contains(&loc)
+                        || caller_pfg.closure_dyn_callsites.contains(&loc);
+                    if self.rta.acx.analysis_options.rceus_ap && is_fn_lowered {
+                        let callee_pfg = &self.func_pfg_map[&callee];
+                        let args_by_index: HashMap<usize, _> =
+                            args.iter().map(|(i, p)| (*i, p)).collect();
+                        let mut flow_params: Vec<usize> =
+                            callee_pfg.param_with_flow.iter().copied().collect();
+                        flow_params.sort_unstable();
+
+                        let mut complete = true;
+                        for cp in flow_params {
+                            let (path, fallback) = if callee_pfg.has_self_parameter {
+                                (args_by_index.get(&cp).map(|p| (*p).clone()), None)
+                            } else if callee_pfg.is_closure_body {
+                                if cp == 1 {
+                                    (args_by_index.get(&1).map(|p| (*p).clone()), None)
+                                } else {
+                                    let tuple = args_by_index.get(&2).map(|p| (*p).clone());
+                                    let field = tuple.as_ref().map(|p| {
+                                        Path::append_projection_elem(
+                                            p,
+                                            PathSelector::Field(cp - 2),
+                                        )
+                                    });
+                                    (field, tuple)
+                                }
+                            } else {
+                                let tuple = args_by_index.get(&2).map(|p| (*p).clone());
+                                let field = tuple.as_ref().map(|p| {
+                                    Path::append_projection_elem(
+                                        p,
+                                        PathSelector::Field(cp - 1),
+                                    )
+                                });
+                                (field, tuple)
+                            };
+
+                            let roots = path
+                                .as_ref()
+                                .and_then(|p| table.roots_of(p))
+                                .or_else(|| fallback.as_ref().and_then(|p| table.roots_of(p)));
+                            if let Some(roots) = roots {
+                                key_parts.push((cp, roots.as_ref().clone()));
+                            } else {
+                                complete = false;
+                                break;
+                            }
+                        }
+                        if !complete {
                             continue;
                         }
-                        key_parts.push((*arg_idx, table.roots_of_node(n).as_ref().clone()));
+                    } else {
+                        // Plain RCEUS-M retains its existing raw-MIR grouping.
+                        for (arg_idx, arg_path) in args {
+                            let Some(n) = table.node(arg_path) else { continue };
+                            if !caller_pfg.flows_at_callsite(n, &loc) {
+                                continue;
+                            }
+                            key_parts.push((*arg_idx, table.roots_of_node(n).as_ref().clone()));
+                        }
                     }
                     if key_parts.is_empty() {
                         continue;

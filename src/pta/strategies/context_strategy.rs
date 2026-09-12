@@ -18,7 +18,7 @@ use rustc_middle::mir::Location;
 use crate::mir::call_site::{BaseCallSite, CSCallSite};
 use crate::mir::context::{Context, ContextCache, ContextElement, ContextId, HybridCtxElem};
 use crate::mir::function::FuncId;
-use crate::mir::path::{CSPath, Path, PathEnum};
+use crate::mir::path::{CSPath, Path, PathEnum, PathSelector};
 use crate::rustc_index::Idx;
 use super::stack_filtering::{StackFilter, SFReachable};
 use crate::pre_analysis::precision_critical_func_identification::func_pointer_flow_analysis::FuncPFG;
@@ -740,7 +740,7 @@ impl ContextStrategy for RCEUSMergeCallSiteSensitive {
 }
 
 // ===========================================================================
-// EXPERIMENTAL (env RCEUS_ARGPROV): argument-provenance-qualified flow-entry.
+// EXPERIMENTAL (`--rceus-ap`): argument-provenance-qualified flow-entry.
 //
 // Refines RCEUS's single flow-entry element [ℓ] into
 //   [ Site(ℓ), ParamProv(p, {entry-args})... ]
@@ -759,7 +759,15 @@ pub enum ProvElem {
 }
 impl ContextElement for ProvElem {}
 
-type ArgParamReach = HashMap<FuncId, HashMap<Location, Vec<(usize, Vec<u32>)>>>;
+/// A logical actual-argument source at a lowered MIR callsite. `Whole(i)` is
+/// raw MIR argument i; `TupleField(i, f)` is field f of raw tuple argument i.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum ArgSlot {
+    Whole(u32),
+    TupleField(u32, u32),
+}
+
+type ArgParamReach = HashMap<FuncId, HashMap<Location, Vec<(ArgSlot, Vec<u32>)>>>;
 
 pub struct RCEUSArgProvSensitive {
     ctx_cache: ContextCache<ProvElem>,
@@ -804,31 +812,60 @@ impl RCEUSArgProvSensitive {
 
     /// For a function's PFG: which caller parameters reach each callsite argument
     /// (reverse reachability). Computed once in pre-analysis.
-    fn build_arg_param_reach(pfg: &FuncPFG) -> HashMap<Location, Vec<(usize, Vec<u32>)>> {
+    fn build_arg_param_reach(pfg: &FuncPFG) -> HashMap<Location, Vec<(ArgSlot, Vec<u32>)>> {
         let mut node_of: HashMap<Rc<Path>, _> = HashMap::new();
+        let mut tuple_fields: HashMap<Rc<Path>, Vec<(u32, _)>> = HashMap::new();
         for n in pfg.graph.node_indices() {
-            node_of.insert(pfg.graph[n].path.clone(), n);
+            let path = pfg.graph[n].path.clone();
+            if let PathEnum::QualifiedPath { base, projection } = &path.value {
+                if let [PathSelector::Field(field)] = projection.as_slice() {
+                    tuple_fields
+                        .entry(base.clone())
+                        .or_default()
+                        .push((*field as u32, n));
+                }
+            }
+            node_of.insert(path, n);
         }
-        let mut out: HashMap<Location, Vec<(usize, Vec<u32>)>> = HashMap::new();
+
+        let reaching_params = |start: petgraph::graph::NodeIndex| {
+            let mut seen: HashSet<_> = HashSet::new();
+            let mut q: VecDeque<_> = VecDeque::new();
+            q.push_back(start);
+            let mut params: BTreeSet<u32> = BTreeSet::new();
+            while let Some(x) = q.pop_front() {
+                if !seen.insert(x) { continue; }
+                if let PathEnum::Parameter { ordinal, .. } = pfg.graph[x].path.value {
+                    params.insert(ordinal as u32);
+                }
+                for e in pfg.graph.edges_directed(x, petgraph::Direction::Incoming) {
+                    q.push_back(e.source());
+                }
+            }
+            params.into_iter().collect::<Vec<_>>()
+        };
+
+        let mut out: HashMap<Location, Vec<(ArgSlot, Vec<u32>)>> = HashMap::new();
         for (loc, (args, _dest)) in &pfg.callsite_to_locals {
-            let mut per_call: Vec<(usize, Vec<u32>)> = Vec::new();
+            let mut per_call: Vec<(ArgSlot, Vec<u32>)> = Vec::new();
             for (arg_idx, arg_path) in args {
-                let start = match node_of.get(arg_path) { Some(&n) => n, None => continue };
-                let mut seen: HashSet<_> = HashSet::new();
-                let mut q: VecDeque<_> = VecDeque::new();
-                q.push_back(start);
-                let mut params: BTreeSet<u32> = BTreeSet::new();
-                while let Some(x) = q.pop_front() {
-                    if !seen.insert(x) { continue; }
-                    if let PathEnum::Parameter { ordinal, .. } = pfg.graph[x].path.value {
-                        params.insert(ordinal as u32);
-                    }
-                    for e in pfg.graph.edges_directed(x, petgraph::Direction::Incoming) {
-                        q.push_back(e.source());
+                if let Some(&start) = node_of.get(arg_path) {
+                    let params = reaching_params(start);
+                    if !params.is_empty() {
+                        per_call.push((ArgSlot::Whole(*arg_idx as u32), params));
                     }
                 }
-                if !params.is_empty() {
-                    per_call.push((*arg_idx, params.into_iter().collect()));
+
+                if let Some(fields) = tuple_fields.get(arg_path) {
+                    for &(field, start) in fields {
+                        let params = reaching_params(start);
+                        if !params.is_empty() {
+                            per_call.push((
+                                ArgSlot::TupleField(*arg_idx as u32, field),
+                                params,
+                            ));
+                        }
+                    }
                 }
             }
             if !per_call.is_empty() {
@@ -851,7 +888,11 @@ impl RCEUSArgProvSensitive {
         let caller_func = callsite.func.func_id;
         let loc = callsite.location;
         let caller_ctx = cache.get_context(callsite.func.cid).unwrap_or(Context::new_empty());
-        let is_flow_entry = !caller_pfg.is_cs_callsite(&loc);
+        // A PFG flow-through site can inherit only when the caller actually has
+        // a flow-entry context. A precision-critical root/entry function starts
+        // a fresh chain even when this location lies on its param-to-return path.
+        let is_flow_entry = !caller_pfg.is_cs_callsite(&loc)
+            || caller_ctx.context_elems.is_empty();
 
         let mut elems: Vec<ProvElem> = Vec::new();
 
@@ -906,10 +947,10 @@ impl RCEUSArgProvSensitive {
                 // Fold the caller's per-parameter provenance onto each CALLER
                 // ARGUMENT: arg_prov[a] = union of entry-arg sets over the caller
                 // parameters that reach argument a.
-                let mut arg_prov: HashMap<u32, BTreeSet<u32>> = HashMap::new();
+                let mut arg_prov: HashMap<ArgSlot, BTreeSet<u32>> = HashMap::new();
                 if let Some(argreach) = arg_param_reach.get(&caller_func).and_then(|m| m.get(&loc)) {
-                    for (arg_idx, caller_params) in argreach {
-                        let entry = arg_prov.entry(*arg_idx as u32).or_default();
+                    for (slot, caller_params) in argreach {
+                        let entry = arg_prov.entry(*slot).or_default();
                         for cp in caller_params {
                             if let Some(s) = caller_map.get(cp) {
                                 for e in s { entry.insert(*e); }
@@ -917,20 +958,19 @@ impl RCEUSArgProvSensitive {
                         }
                     }
                 }
-                // Map caller-argument provenance onto CALLEE PARAMETER ordinals,
-                // mirroring the dispatch handling in the worklist (see
-                // precision_critical_func_identification.rs):
-                //   static      : callee param i   <- caller arg i        (1-1)
-                //   closure/dyn : callee param 1   <- caller arg 1 (receiver)
-                //                 callee param j>=2 <- caller arg 2 (tuple)
-                //   fnptr/other : callee param j   <- caller arg 2 (tuple, all params)
+                // Map logical actuals onto CALLEE PARAMETER ordinals. Ordinary
+                // calls are positional. Fn* lowering uses `(receiver, tuple)`:
+                // closure bodies receive receiver + tuple fields, function
+                // items/pointers receive tuple fields only, and an actual trait
+                // implementation method consumes the raw pair.
                 // Only callee parameters that reach the callee's return carry
                 // provenance (mirrors the Case-2 seed): a parameter that does not
                 // reach g's return produces "dead" provenance that never reaches
                 // an output boundary, so tracking it would add contexts without
                 // refining any return/callee points-to set.
                 let is_static = caller_pfg.static_callsites.contains(&loc);
-                let is_closure_dyn = caller_pfg.closure_dyn_callsites.contains(&loc);
+                let is_fn_lowered = caller_pfg.fn_ptr_def_callsites.contains(&loc)
+                    || caller_pfg.closure_dyn_callsites.contains(&loc);
                 let empty: BTreeSet<u32> = BTreeSet::new();
                 let mut callee_params: Vec<u32> =
                     cpfg.param_with_flow.iter().map(|x| *x as u32).collect();
@@ -938,14 +978,32 @@ impl RCEUSArgProvSensitive {
                 callee_params.dedup();
                 let mut prov: Vec<(u32, Vec<u32>)> = Vec::new();
                 for cp in callee_params {
-                    let set: &BTreeSet<u32> = if is_static {
-                        arg_prov.get(&cp).unwrap_or(&empty)
-                    } else if is_closure_dyn {
-                        if cp == 1 { arg_prov.get(&1).unwrap_or(&empty) }
-                        else { arg_prov.get(&2).unwrap_or(&empty) }
+                    let (primary, fallback) = if is_static || !is_fn_lowered {
+                        (ArgSlot::Whole(cp), None)
+                    } else if cpfg.has_self_parameter {
+                        // An actual Fn/FnMut/FnOnce implementation consumes the
+                        // raw `(receiver, tuple)` MIR signature.
+                        (ArgSlot::Whole(cp), None)
+                    } else if cpfg.is_closure_body {
+                        // Closure body: formal 1 is the receiver; formals 2..N
+                        // are fields 0.. of the lowered tuple argument.
+                        if cp == 1 {
+                            (ArgSlot::Whole(1), None)
+                        } else {
+                            (ArgSlot::TupleField(2, cp - 2), Some(ArgSlot::Whole(2)))
+                        }
                     } else {
-                        arg_prov.get(&2).unwrap_or(&empty)
+                        // Function item/pointer reached through Fn*: the receiver
+                        // selects the target but is not passed to it. Formal i is
+                        // field i-1 of the tuple argument.
+                        (ArgSlot::TupleField(2, cp - 1), Some(ArgSlot::Whole(2)))
                     };
+                    // Whole-tuple provenance is a conservative fallback for a
+                    // tuple whose construction/projections are unavailable.
+                    let set = arg_prov
+                        .get(&primary)
+                        .or_else(|| fallback.and_then(|slot| arg_prov.get(&slot)))
+                        .unwrap_or(&empty);
                     if !set.is_empty() {
                         prov.push((cp, set.iter().copied().collect()));
                     }
@@ -1041,3 +1099,170 @@ impl ContextStrategy for RCEUSArgProvSensitive {
     }
 }
 
+// ===========================================================================
+// EXPERIMENTAL (`--rceus-m --rceus-ap`): merged flow-entry with
+// argument-provenance qualification.
+//
+// This is deliberately a separate context strategy. RCEUS-M and RCEUS-AP keep
+// their existing behavior. At a new flow entry this strategy first replaces
+// the callsite location with RCEUS-M's canonical group representative, then
+// applies RCEUS-AP to construct
+//   [ Site(canonical(ℓ)), ParamProv(p, {entry-args})... ].
+// Flow-through calls retain the inherited canonical Site and only remap AP's
+// provenance, exactly as RCEUS-AP normally does.
+// ===========================================================================
+
+pub struct RCEUSMergeArgProvSensitive {
+    argprov: RCEUSArgProvSensitive,
+}
+
+impl RCEUSMergeArgProvSensitive {
+    pub fn new(k: usize) -> Self {
+        Self { argprov: RCEUSArgProvSensitive::new(k) }
+    }
+
+    /// Replace a flow-entry callsite's location with its RCEUS-M representative.
+    /// Flow-through callsites are returned unchanged so AP can inherit the Site
+    /// already carried by the caller's context.
+    fn canonicalize_flow_entry(
+        callsite: &Rc<CSCallSite>,
+        caller_pfg: &FuncPFG,
+        callee: FuncId,
+        caller_context_is_empty: bool,
+    ) -> Rc<CSCallSite> {
+        if caller_pfg.is_cs_callsite(&callsite.location) && !caller_context_is_empty {
+            return callsite.clone();
+        }
+
+        let canonical = caller_pfg.canonical_flow_entry(&callsite.location, callee);
+        if canonical == callsite.location {
+            return callsite.clone();
+        }
+
+        let mut merged_callsite = callsite.as_ref().clone();
+        merged_callsite.location = canonical;
+        Rc::new(merged_callsite)
+    }
+
+    fn merged_argprov_context(
+        cache: &mut ContextCache<ProvElem>,
+        func_pfg_map: &HashMap<FuncId, FuncPFG>,
+        arg_param_reach: &ArgParamReach,
+        noprov_callees: &HashSet<FuncId>,
+        noprov_sites: &HashSet<FuncId>,
+        callsite: &Rc<CSCallSite>,
+        caller_pfg: &FuncPFG,
+        callee: FuncId,
+    ) -> ContextId {
+        let caller_context_is_empty = cache
+            .get_context(callsite.func.cid)
+            .map_or(true, |ctx| ctx.context_elems.is_empty());
+        let merged_callsite = Self::canonicalize_flow_entry(
+            callsite,
+            caller_pfg,
+            callee,
+            caller_context_is_empty,
+        );
+        RCEUSArgProvSensitive::argprov_context(
+            cache,
+            func_pfg_map,
+            arg_param_reach,
+            noprov_callees,
+            noprov_sites,
+            &merged_callsite,
+            caller_pfg,
+            callee,
+        )
+    }
+}
+
+impl ContextStrategy for RCEUSMergeArgProvSensitive {
+    type E = ProvElem;
+
+    fn empty_context(&self) -> Rc<Context<ProvElem>> {
+        self.argprov.empty_context()
+    }
+
+    fn get_empty_context_id(&mut self) -> ContextId {
+        self.argprov.get_empty_context_id()
+    }
+
+    fn get_context_id(&mut self, context: &Rc<Context<ProvElem>>) -> ContextId {
+        self.argprov.get_context_id(context)
+    }
+
+    fn get_context_by_id(&self, context_id: ContextId) -> Rc<Context<ProvElem>> {
+        self.argprov.get_context_by_id(context_id)
+    }
+
+    fn get_context_iter(&self) -> Option<Iter<'_, Rc<Context<ProvElem>>, ContextId>> {
+        self.argprov.get_context_iter()
+    }
+
+    fn new_static_call_context(&mut self, callsite: &Rc<CSCallSite>, callee: FuncId) -> ContextId {
+        if self.argprov.cs_funcs.contains(&callee) {
+            if !self.argprov.func_pfg_map.contains_key(&callee) {
+                return self.get_empty_context_id();
+            }
+            if let Some(caller_pfg) = self.argprov.func_pfg_map.get(&callsite.func.func_id) {
+                return Self::merged_argprov_context(
+                    &mut self.argprov.ctx_cache,
+                    &self.argprov.func_pfg_map,
+                    &self.argprov.arg_param_reach,
+                    &self.argprov.noprov_callees,
+                    &self.argprov.noprov_sites,
+                    callsite,
+                    caller_pfg,
+                    callee,
+                );
+            }
+        }
+        self.get_empty_context_id()
+    }
+
+    fn new_instance_call_context(
+        &mut self,
+        callsite: &Rc<CSCallSite>,
+        _receiver: Option<&Rc<CSPath>>,
+        callee: FuncId,
+    ) -> Option<ContextId> {
+        if self.argprov.cs_funcs.contains(&callee) {
+            if !self.argprov.func_pfg_map.contains_key(&callee) {
+                return Some(self.get_empty_context_id());
+            }
+            if let Some(caller_pfg) = self.argprov.func_pfg_map.get(&callsite.func.func_id) {
+                return Some(Self::merged_argprov_context(
+                    &mut self.argprov.ctx_cache,
+                    &self.argprov.func_pfg_map,
+                    &self.argprov.arg_param_reach,
+                    &self.argprov.noprov_callees,
+                    &self.argprov.noprov_sites,
+                    callsite,
+                    caller_pfg,
+                    callee,
+                ));
+            }
+        }
+        Some(self.get_empty_context_id())
+    }
+
+    fn set_prec_crit_fn_ident_data(
+        &mut self,
+        cs_funcs: HashSet<FuncId>,
+        func_pfg_map: HashMap<FuncId, FuncPFG>,
+    ) {
+        self.argprov.set_prec_crit_fn_ident_data(cs_funcs, func_pfg_map);
+    }
+
+    fn set_noprov_callees(&mut self, callees: HashSet<FuncId>) {
+        self.argprov.set_noprov_callees(callees);
+    }
+
+    fn set_noprov_sites(&mut self, sites: HashSet<FuncId>) {
+        self.argprov.set_noprov_sites(sites);
+    }
+
+    fn cs_funcs(&self) -> Option<&HashSet<FuncId>> {
+        self.argprov.cs_funcs()
+    }
+}

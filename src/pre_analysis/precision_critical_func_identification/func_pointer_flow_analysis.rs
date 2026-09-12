@@ -11,7 +11,7 @@ use crate::mir::analysis_context::AnalysisContext;
 use crate::mir::function::FuncId;
 use rustc_middle::mir::Location;
 use crate::pre_analysis::rta::rta::RapidTypeAnalysis;
-use crate::mir::path::PathEnum;
+use crate::mir::path::{PathEnum, PathSelector};
 use rustc_span::source_map::Spanned;
 
 
@@ -118,6 +118,14 @@ pub struct FuncPFG {
     pub cs_callsites: HashSet<Location>,
     // parameter with flow to return
     pub param_with_flow: HashSet<usize>,
+    /// The callee body is a compiler-generated closure/coroutine body. Calls
+    /// through `Fn*` pass the receiver as formal 1 and unpack the argument tuple
+    /// into formals 2..N for these bodies.
+    pub is_closure_body: bool,
+    /// The callee is an actual trait-method implementation. Unlike a closure or
+    /// function item reached through `Fn*`, its MIR consumes the raw receiver and
+    /// tuple arguments directly.
+    pub has_self_parameter: bool,
     /// Redundant flow-entry callsite merging.
     ///
     /// Keyed by `(callsite, callee)`, not by callsite alone: one location can
@@ -131,7 +139,7 @@ pub struct FuncPFG {
 
 
 impl FuncPFG {
-    pub fn new(func_id: FuncId) -> Self {
+    pub fn new(func_id: FuncId, is_closure_body: bool, has_self_parameter: bool) -> Self {
         FuncPFG {
             graph: Graph::new(),
             edges: HashMap::new(),
@@ -143,6 +151,8 @@ impl FuncPFG {
             closure_dyn_callsites: HashSet::new(),
             cs_callsites: HashSet::new(),
             param_with_flow: HashSet::new(),
+            is_closure_body,
+            has_self_parameter,
             flow_entry_merge: HashMap::new(),
         }
     }
@@ -436,12 +446,15 @@ impl<'a, 'rta, 'tcx, 'compilation> FuncPointerFlowAnalysis<'a, 'rta, 'tcx, 'comp
             func_ref.generic_args.clone()
         );
 
+        let is_closure_body = rta.acx.tcx.is_closure_or_coroutine(func_ref.def_id);
+        let has_self_parameter = crate::util::has_self_parameter(rta.acx.tcx, func_ref.def_id);
+
         FuncPointerFlowAnalysis {
             rta,
             func_id,
             mir,
             substs_specializer,
-            pfg: FuncPFG::new(func_id),
+            pfg: FuncPFG::new(func_id, is_closure_body, has_self_parameter),
         }
     }
 
@@ -554,8 +567,22 @@ impl<'a, 'rta, 'tcx, 'compilation> FuncPointerFlowAnalysis<'a, 'rta, 'tcx, 'comp
             mir::Rvalue::Cast(_cast_kind, operand, _ty) => {
                 self.visit_use(lplace, operand);
             }
-            mir::Rvalue::Aggregate(_ ,operands) => {
-                for (_i, operand) in operands.iter().enumerate() {
+            mir::Rvalue::Aggregate(aggregate_kind, operands) => {
+                let is_tuple = self.rta.acx.analysis_options.rceus_ap
+                    && matches!(**aggregate_kind, mir::AggregateKind::Tuple);
+                for (i, operand) in operands.iter().enumerate() {
+                    if is_tuple {
+                        if let Some(src) = self.pointer_operand_path(operand) {
+                            let dst = Path::new_local_parameter_or_result(
+                                self.func_id,
+                                lplace.local.as_usize(),
+                                self.mir.arg_count,
+                            );
+                            let dst_field =
+                                Path::append_projection_elem(&dst, PathSelector::Field(i));
+                            self.pfg.add_edge(src, dst_field, PFGEdgeEnum::IntraPFGEdge);
+                        }
+                    }
                     self.visit_use(lplace, operand);
                 }
             }
@@ -588,12 +615,56 @@ impl<'a, 'rta, 'tcx, 'compilation> FuncPointerFlowAnalysis<'a, 'rta, 'tcx, 'comp
                     let lpath = Path::new_local_parameter_or_result(self.func_id, lplace.local.as_usize(), self.mir.arg_count); 
                     let rpath = Path::new_local_parameter_or_result(self.func_id, place.local.as_usize(), self.mir.arg_count);
                     let edge_kind = PFGEdgeEnum::IntraPFGEdge;
-                    self.pfg.add_edge(rpath, lpath, edge_kind);
+                    self.pfg.add_edge(rpath.clone(), lpath.clone(), edge_kind);
+
+                    // Preserve tuple components across whole-tuple moves/copies.
+                    // Fn/FnMut/FnOnce lower user arguments into such tuples, and
+                    // argument provenance must follow each field independently.
+                    if self.rta.acx.analysis_options.rceus_ap {
+                        if let TyKind::Tuple(field_tys) = place_ty.kind() {
+                            for (i, field_ty) in field_tys.iter().enumerate() {
+                                if self.type_contains_pointer_or_ref(field_ty) {
+                                    let rfield = Path::append_projection_elem(
+                                        &rpath,
+                                        PathSelector::Field(i),
+                                    );
+                                    let lfield = Path::append_projection_elem(
+                                        &lpath,
+                                        PathSelector::Field(i),
+                                    );
+                                    self.pfg.add_edge(
+                                        rfield,
+                                        lfield,
+                                        PFGEdgeEnum::IntraPFGEdge,
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
             }
             _ => {} // We do not consider constant operands for pointer flow analysis.
         }
 
+    }
+
+    /// Return the local PFG path for a pointer-carrying operand. Constants have
+    /// no caller-parameter provenance and therefore intentionally return None.
+    fn pointer_operand_path(&mut self, operand: &mir::Operand<'tcx>) -> Option<Rc<Path>> {
+        match operand {
+            mir::Operand::Copy(place) | mir::Operand::Move(place) => {
+                let ty = place.ty(&self.mir.local_decls, self.acx().tcx).ty;
+                let ty = self.substs_specializer.specialize_generic_argument_type(ty);
+                self.type_contains_pointer_or_ref(ty).then(|| {
+                    Path::new_local_parameter_or_result(
+                        self.func_id,
+                        place.local.as_usize(),
+                        self.mir.arg_count,
+                    )
+                })
+            }
+            mir::Operand::Constant(_) => None,
+        }
     }
 
     fn add_ref_pfg_edge(&mut self, lplace: &mir::Place<'tcx>, rplace: &mir::Place<'tcx>) {

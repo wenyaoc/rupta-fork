@@ -14,7 +14,7 @@ use self::andersen::AndersenPTA;
 use self::context_sensitive::ContextSensitivePTA;
 use self::strategies::context_strategy::{
     KCallSiteSensitive, RCEUSCallSiteSensitive, RCEUSMergeCallSiteSensitive,
-    RCEUSArgProvSensitive, SelectiveCallSiteSensitive,
+    RCEUSArgProvSensitive, RCEUSMergeArgProvSensitive, SelectiveCallSiteSensitive,
 };
 use crate::graph::pag::*;
 use crate::mir::function::FuncId;
@@ -93,14 +93,20 @@ impl PTACallbacks {
                 PTAType::CallSiteSensitive => {
                     let k = self.options.context_depth as usize;
                     if self.options.rceus_m {
-                        Box::new(ContextSensitivePTA::new(&mut acx, RCEUSMergeCallSiteSensitive::new(k)))
+                        // RCEUS-M-ARGPROV: canonicalize the flow-entry site
+                        // first, then qualify it with argument provenance.
+                        if self.options.rceus_ap {
+                            Box::new(ContextSensitivePTA::new(&mut acx, RCEUSMergeArgProvSensitive::new(k)))
+                        } else {
+                            Box::new(ContextSensitivePTA::new(&mut acx, RCEUSMergeCallSiteSensitive::new(k)))
+                        }
                     } else if self.options.rceus && self.options.selective_cs {
                         // RCEUS-SEL: RCEUS context for critical callees,
                         // context-insensitive for the rest.
                         Box::new(ContextSensitivePTA::new(&mut acx, RCEUSCallSiteSensitive::new_selective(k)))
                     } else if self.options.rceus {
-                        // RCEUS_ARGPROV: argument-provenance-qualified flow entry.
-                        if std::env::var("RCEUS_ARGPROV").is_ok() {
+                        // RCEUS-AP: argument-provenance-qualified flow entry.
+                        if self.options.rceus_ap {
                             Box::new(ContextSensitivePTA::new(&mut acx, RCEUSArgProvSensitive::new(k)))
                         } else {
                             Box::new(ContextSensitivePTA::new(&mut acx, RCEUSCallSiteSensitive::new(k)))
@@ -147,4 +153,3 @@ impl rustc_driver::Callbacks for PTACallbacks {
         Compilation::Continue
     }
 }
-

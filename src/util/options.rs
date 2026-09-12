@@ -69,6 +69,10 @@ fn make_options_parser() -> Command<'static> {
             .long("rceus-m")
             .takes_value(false)
             .help("Enable rceus with flow-entry callsite merging."))
+        .arg(Arg::new("rceus-ap")
+            .long("rceus-ap")
+            .takes_value(false)
+            .help("Enable rceus with argument-provenance-qualified flow entries."))
         .arg(Arg::new("selective-cs")
             .long("selective-cs")
             .takes_value(false)
@@ -129,6 +133,9 @@ pub struct AnalysisOptions {
     pub rceus: bool,
     /// RCEUS + merging of redundant flow-entry callsites. Implies `rceus`.
     pub rceus_m: bool,
+    /// RCEUS + argument-provenance-qualified flow entries. Implies `rceus`.
+    /// Combined with `rceus_m`, selects the merged argument-provenance strategy.
+    pub rceus_ap: bool,
     /// Selective context sensitivity: plain k-callsite sensitivity, but only for
     /// the precision-critical functions RCEUS's pre-analysis identifies. Every
     /// other callee is analysed context-insensitively.
@@ -155,6 +162,7 @@ impl Default for AnalysisOptions {
             stack_filtering: false,
             rceus: false,
             rceus_m: false,
+            rceus_ap: false,
             selective_cs: false,
             dump_stats: true,
             call_graph_output: None,
@@ -237,10 +245,10 @@ impl AnalysisOptions {
         self.cast_constraint = !matches.contains_id("no-cast-constraint");
         self.stack_filtering = matches.contains_id("stack-filtering");
         self.rceus_m = matches.contains_id("rceus-m");
-        // --rceus-m is RCEUS plus flow-entry merging, so it implies --rceus.
-        // Setting this before context_depth is resolved below lets --rceus-m
-        // inherit the same k=0 default as --rceus.
-        self.rceus = matches.contains_id("rceus") || self.rceus_m;
+        self.rceus_ap = matches.contains_id("rceus-ap");
+        // Both specialized RCEUS strategies imply --rceus. Setting this before
+        // context_depth is resolved below gives them the same k=0 default.
+        self.rceus = matches.contains_id("rceus") || self.rceus_m || self.rceus_ap;
         // Selective-CS reuses RCEUS's precision-critical function identification.
         // Alone it replaces RCEUS's context augmentation with plain k-cfa on the
         // critical callees; combined with --rceus it keeps the augmentation and
